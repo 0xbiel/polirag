@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Alignment},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, List, ListItem, ListState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, List, ListItem, ListState, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::mpsc;
@@ -113,7 +113,7 @@ impl TuiApp {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions.".to_string(),
+                    content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions. IMPORTANT: You MUST answer in the same language as the user's message (e.g. if user asks in Catalan, answer in Catalan; if in English, answer in English), even if the retrieved documents are in Spanish.".to_string(),
                     thinking_collapsed: false,
                 }
             ],
@@ -260,7 +260,7 @@ fn render_logo() -> Vec<Line<'static>> {
 }
 
 fn draw_menu(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -315,7 +315,7 @@ fn draw_menu(frame: &mut Frame, app: &mut TuiApp) {
 }
 
 fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let outer_block = Block::default()
         .borders(Borders::ALL)
@@ -374,12 +374,30 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
         ]));
     }
 
-    app.content_height = lines.len() as u16;
+    // Estimate content height based on wrapping
+    // content_height = sum of visual lines
+    let mut total_height = 0;
+    for line in &lines {
+        // Reconstruct string to measure wrapping (styles don't affect wrapping usually)
+        let mut full_line_str = String::new();
+        for span in &line.spans {
+            full_line_str.push_str(&span.content);
+        }
+        
+        let wrapped_lines = textwrap::wrap(&full_line_str, max_width);
+        // Ensure at least 1 line for empty strings? textwrap returns empty vec for empty string.
+        let output_lines = wrapped_lines.len().max(1);
+        total_height += output_lines;
+    }
+    app.content_height = total_height as u16;
+
     let max_scroll = app.content_height.saturating_sub(app.viewport_height);
     if app.follow_bottom { app.scroll_offset = max_scroll; }
     else if app.scroll_offset > max_scroll { app.scroll_offset = max_scroll; }
 
-    let messages = Paragraph::new(Text::from(lines)).scroll((app.scroll_offset, 0));
+    let messages = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset, 0));
     frame.render_widget(messages, messages_area);
 
     if app.content_height > app.viewport_height {
@@ -407,12 +425,12 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     if !app.is_thinking {
         let cursor_x = chunks[2].x + app.input_cursor as u16;
         let cursor_y = chunks[2].y + 1;
-        frame.set_cursor(cursor_x.min(chunks[2].x + chunks[2].width - 1), cursor_y);
+        frame.set_cursor_position((cursor_x.min(chunks[2].x + chunks[2].width - 1), cursor_y));
     }
 }
 
 fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -476,7 +494,7 @@ fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
 }
 
 fn draw_login(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)).title(" Login to PoliformaT ");
     let inner_area = block.inner(size);
@@ -513,14 +531,14 @@ fn draw_login(frame: &mut Frame, app: &mut TuiApp) {
         } else {
             (form_layout_pin[1].x + app.login_pin.len() as u16 + 1, form_layout_pin[1].y + 1)
         };
-        frame.set_cursor(cursor_x, cursor_y);
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
     
     frame.render_widget(Paragraph::new("Tab Switch Field │ Enter Submit │ Esc Cancel").style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center), layout[7]);
 }
 
 fn draw_sync(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let title = if app.sync_running {
         format!(" Syncing... {} ", THROBBER_FRAMES[app.throbber_frame])
@@ -576,7 +594,7 @@ fn draw_sync(frame: &mut Frame, app: &mut TuiApp) {
 }
 
 fn _draw_settings_old(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1421,7 +1439,7 @@ async fn run_sync_with_logging(
 
 
 fn draw_settings(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
