@@ -1,12 +1,12 @@
 # PoliRag: Retrieval-Augmented Generation over PoliformaT
 
-**0xbiel**
+_By 0xbiel_
 
 ## Abstract
 
 PoliRag is a Retrieval-Augmented Generation (RAG) system designed to turn a user’s PoliformaT course content (subjects, announcements, lesson pages, teaching guides, and downloaded resources like PDFs) into a searchable personal knowledge base. At query time, PoliRag retrieves the most relevant snippets from that knowledge base and provides them as grounded context to a language model, improving factuality and reducing hallucinations compared to prompting without retrieval.
 
-## 1 What PoliRag is
+## What is PoliRag?
 
 PoliRag combines three components:
 
@@ -16,9 +16,9 @@ PoliRag combines three components:
 
 The design goal is a personal, offline-first RAG workflow: embeddings are computed locally, and the on-disk index can be rebuilt or re-embedded when the embedding model changes.
 
-## 5 Setup
+## Setup
 
-### 5.1 Download the Embedding Model
+### Download the Embedding Model
 
 PoliRag requires a local embedding model to function. Download the `embeddinggemma-300m-Q4_0.gguf` file and place it in the root directory of the project:
 
@@ -30,17 +30,16 @@ wget https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embedd
 curl -L -o embeddinggemma-300m-Q4_0.gguf https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf
 ```
 
-**Note**: This file is approximately 265 MB and is required for the RAG system to generate embeddings.
+> [!NOTE]
+> This file is approximately 265 MB and is required for the RAG system to generate embeddings.
 
-## 6 Configuration, CLI, and sync ops
+## Configuration, CLI, and Operations
 
-### 6.1 Configuration (config.rs)
+### Configuration (`config.rs`)
 
 PoliRag persists user settings and cached credentials in a JSON config file stored under the OS application data directory (e.g., via `dirs::data_dir()`). Credentials are stored as an encrypted blob (XOR + base64) so they are not plain-text on disk.
 
 The configuration also tracks which LLM backend to use (LM Studio local endpoint vs OpenRouter), plus the most recently selected model.
-
-**Listing 5: Provider selection and config model (excerpt).**
 
 ```rust
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
@@ -69,17 +68,15 @@ pub struct Config {
 }
 ```
 
-### 6.2 Entrypoint and commands (main.rs)
+### Entrypoint and Commands (`main.rs`)
 
-The application exposes a small CLI with clap:
+The application exposes a small CLI with `clap`:
 
-• **Menu**: the default interactive terminal UI.
-• **Sync**: a headless scrape + index build suitable for cron/automation.
-• **ExtractPdf**: an internal subcommand used to isolate PDF text extraction into a subprocess.
+- **Menu**: The default interactive terminal UI.
+- **Sync**: A headless scrape + index build suitable for cron/automation.
+- **ExtractPdf**: An internal subcommand used to isolate PDF text extraction into a subprocess.
 
 On startup, PoliRag initializes logging, loads the vector index path from the global config directory, and initializes the RAG, scraper, and LLM client.
-
-**Listing 6: CLI commands (excerpt).**
 
 ```rust
 #[derive(Subcommand, Clone)]
@@ -91,11 +88,9 @@ enum Commands {
 }
 ```
 
-### 6.3 Sync pipeline (ops.rs)
+### Sync Pipeline (`ops.rs`)
 
 The sync operation is responsible for ensuring authentication (cached credentials or environment variables), clearing prior state, scraping subjects, extracting resources, and finally adding documents to the vector index.
-
-**Listing 7: Sync flow (excerpt).**
 
 ```rust
 pub async fn run_sync(rag: Arc<rag::RagSystem>, poliformat: Arc<scrapper::PoliformatClient>)
@@ -117,8 +112,8 @@ pub async fn run_sync(rag: Arc<rag::RagSystem>, poliformat: Arc<scrapper::Polifo
 }
 ```
 
-## 7 Limitations and next steps
+## Limitations and Next Steps
 
-• **Index scalability**: the current approach is linear scan; a future upgrade could add ANN (HNSW) for very large corpora.
-• **Chunking quality**: word-based chunking is a heuristic; sentence/semantic chunking often improves retrieval.
-• **Grounding UX**: adding explicit per-snippet source identifiers and timestamps would make answers easier to trust.
+- **Index scalability**: The current approach is linear scan; a future upgrade could add ANN (HNSW) for very large corpora.
+- **Chunking quality**: Word-based chunking is a heuristic; sentence/semantic chunking often improves retrieval.
+- **Grounding UX**: Adding explicit per-snippet source identifiers and timestamps would make answers easier to trust.
