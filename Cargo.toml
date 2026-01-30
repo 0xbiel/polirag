@@ -53,6 +53,7 @@ async-stream = "0.3.6"
 llama-cpp-2 = "0.1.132"
 llama-cpp-sys-2 = "0.1.132"
 tempfile = "3.10"
+text-splitter = "0.29.3"
 # hf-hub = "0.3"
 
 [profile.release]

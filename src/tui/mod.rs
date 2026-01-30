@@ -433,10 +433,13 @@ fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
     let content = if let Some(stats) = &app.rag_stats {
         let mut lines = vec![
             Line::from(""),
-            Line::from(vec![Span::styled("  📁 Storage Path:  ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.storage_path)]),
-            Line::from(vec![Span::styled("  💾 Index Size:    ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.format_file_size(), Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled("  📄 Documents:     ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.document_count.to_string(), Style::default().fg(Color::Yellow))]),
-            Line::from(vec![Span::styled("  📝 Content Size:  ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(stats.format_content_size())]),
+            Line::from(vec![Span::styled("  📁 Storage Path:    ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.storage_path)]),
+            Line::from(vec![Span::styled("  🗄️  Store Type:      ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(&stats.store_type, Style::default().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled("  ✂️  Chunking:        ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.chunking_strategy)]),
+            Line::from(vec![Span::styled("  🧠 Embedding Model: ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.embedding_model)]),
+            Line::from(vec![Span::styled("  💾 Index Size:      ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.format_file_size(), Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled("  📄 Documents:       ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.document_count.to_string(), Style::default().fg(Color::Yellow))]),
+            Line::from(vec![Span::styled("  📝 Content Size:    ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(stats.format_content_size())]),
             Line::from(""),
             Line::from(Span::styled("  Documents by Type:", Style::default().add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED))),
         ];

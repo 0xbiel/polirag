@@ -195,22 +195,11 @@ impl EmbeddingModel {
     }
 
     fn chunk_text(&self, text: &str) -> Vec<String> {
-        let mut chunks = Vec::new();
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let mut current_chunk = String::new();
-        for word in words {
-            if current_chunk.len() + word.len() + 1 > MAX_CHUNK_CHARS {
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk.trim().to_string());
-                    current_chunk = String::new();
-                }
-            }
-            if !current_chunk.is_empty() { current_chunk.push(' '); }
-            current_chunk.push_str(word);
-        }
-        if !current_chunk.is_empty() { chunks.push(current_chunk.trim().to_string()); }
-        chunks
+        let splitter = text_splitter::TextSplitter::new(MAX_CHUNK_CHARS);
+        
+        splitter.chunks(text)
+            .map(|s: &str| s.to_string())
+            .collect()
     }
     
-
 }
