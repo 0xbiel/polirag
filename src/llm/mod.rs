@@ -3,6 +3,7 @@ use reqwest::Client;
 use anyhow::Result;
 use futures::Stream;
 use std::pin::Pin;
+use ratatui::text::Line;
 
 #[derive(Clone)]
 pub struct LlmClient {
@@ -39,7 +40,10 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip)]
     #[serde(default)]
-    pub thinking_collapsed: bool, 
+    pub thinking_collapsed: bool,
+    
+    #[serde(skip)]
+    pub render_cache: RenderCache,
 }
 
 #[derive(Deserialize)]
@@ -256,4 +260,27 @@ impl LlmClient {
 pub enum StreamEvent {
     Content(String),
     Usage(Usage),
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct RenderCache {
+    pub inner: Option<(usize, Vec<Line<'static>>, usize)>,
+}
+
+impl Serialize for RenderCache {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_none()
+    }
+}
+
+impl<'de> Deserialize<'de> for RenderCache {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(RenderCache::default())
+    }
 }

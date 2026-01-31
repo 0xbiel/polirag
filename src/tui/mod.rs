@@ -115,6 +115,7 @@ impl TuiApp {
                     role: "system".to_string(),
                     content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions. IMPORTANT: You MUST answer in the same language as the user's message (e.g. if user asks in Catalan, answer in Catalan; if in English, answer in English), even if the retrieved documents are in Spanish.".to_string(),
                     thinking_collapsed: false,
+                    render_cache: crate::llm::RenderCache::default(),
                 }
             ],
             input: String::new(),
@@ -339,26 +340,87 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     app.viewport_height = messages_area.height;
     
     let max_width = messages_area.width.saturating_sub(4) as usize;
+    let mut total_height = 0;
     let mut lines: Vec<Line> = Vec::new();
     
-    for msg in &app.messages {
+    // Use mutable iteration to update render cache
+    for msg in &mut app.messages {
         match msg.role.as_str() {
             "user" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                let mut msg_lines = Vec::new();
+                let mut msg_height = 0;
+                
+                msg_lines.push(Line::from(""));
+                msg_lines.push(Line::from(vec![
                     Span::styled(" ▶ You ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
                 ]));
-                // Users messages are usually simple, but we can markdown them too
-                let rendered = markdown::render_markdown(&msg.content, max_width, false);
-                lines.extend(rendered);
+                msg_height += 2;
+                
+                // Check cache
+                let mut use_cache = false;
+                if let Some((cached_width, _, _)) = &msg.render_cache.inner {
+                    if *cached_width == max_width {
+                        use_cache = true;
+                    }
+                }
+                
+                if !use_cache {
+                    let rendered = markdown::render_markdown(&msg.content, max_width, false);
+                    // Calculate height for this message
+                    let mut rendered_height = 0;
+                    for line in &rendered {
+                         let line_str = line.to_string();
+                         let wrapped = textwrap::wrap(&line_str, max_width);
+                         rendered_height += wrapped.len().max(1);
+                    }
+                    msg.render_cache.inner = Some((max_width, rendered, rendered_height));
+                }
+                
+                if let Some((_, cached_lines, cached_height)) = &msg.render_cache.inner {
+                    msg_lines.extend(cached_lines.clone());
+                    msg_height += *cached_height;
+                }
+                
+                lines.extend(msg_lines);
+                total_height += msg_height;
             }
             "assistant" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                let mut msg_lines = Vec::new();
+                let mut msg_height = 0;
+                
+                msg_lines.push(Line::from(""));
+                msg_lines.push(Line::from(vec![
                     Span::styled(" ◆ Assistant ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 ]));
-                let rendered = markdown::render_markdown(&msg.content, max_width, msg.thinking_collapsed);
-                lines.extend(rendered);
+                msg_height += 2;
+                
+                 // Check cache
+                let mut use_cache = false;
+                if let Some((cached_width, _, _)) = &msg.render_cache.inner {
+                    if *cached_width == max_width {
+                        use_cache = true;
+                    }
+                }
+                
+                if !use_cache {
+                   let rendered = markdown::render_markdown(&msg.content, max_width, msg.thinking_collapsed);
+                   // Calculate height
+                   let mut rendered_height = 0;
+                   for line in &rendered {
+                        let line_str = line.to_string();
+                        let wrapped = textwrap::wrap(&line_str, max_width);
+                        rendered_height += wrapped.len().max(1);
+                   }
+                   msg.render_cache.inner = Some((max_width, rendered, rendered_height));
+                }
+                
+                if let Some((_, cached_lines, cached_height)) = &msg.render_cache.inner {
+                    msg_lines.extend(cached_lines.clone());
+                    msg_height += *cached_height;
+                }
+                
+                lines.extend(msg_lines);
+                total_height += msg_height;
             }
             _ => {}
         }
@@ -372,10 +434,12 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
         ]));
+        total_height += 2;
     }
 
     // Estimate content height based on wrapping
     // content_height = sum of visual lines
+    /*
     let mut total_height = 0;
     for line in &lines {
         // Reconstruct string to measure wrapping (styles don't affect wrapping usually)
@@ -389,6 +453,7 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
         let output_lines = wrapped_lines.len().max(1);
         total_height += output_lines;
     }
+    */
     app.content_height = total_height as u16;
 
     let max_scroll = app.content_height.saturating_sub(app.viewport_height);
@@ -740,7 +805,7 @@ pub async fn run_app(state: Arc<AppState>) -> anyhow::Result<()> {
         terminal.draw(|f| draw(f, &mut app))?;
 
         // Check LLM results
-        if let Ok(result) = rx_llm.try_recv() {
+        while let Ok(result) = rx_llm.try_recv() {
             match result {
                 LlmResult::StreamChunk(event) => {
                     match event {
@@ -748,6 +813,7 @@ pub async fn run_app(state: Arc<AppState>) -> anyhow::Result<()> {
                              if let Some(last) = app.messages.last_mut() {
                                 if last.role == "assistant" {
                                     last.content.push_str(&chunk);
+                                    last.render_cache.inner = None;
                                 }
                             }
                             app.follow_bottom = true;
@@ -763,11 +829,12 @@ pub async fn run_app(state: Arc<AppState>) -> anyhow::Result<()> {
                     if let Some(last) = app.messages.last_mut() {
                          if last.role == "assistant" {
                              last.content = last.content.trim().to_string();
+                             last.render_cache.inner = None;
                          }
                     }
                 }
                 LlmResult::Error(e) => {
-                    app.messages.push(ChatMessage { role: "assistant".to_string(), content: format!("Error: {}", e), thinking_collapsed: false });
+                    app.messages.push(ChatMessage { role: "assistant".to_string(), content: format!("Error: {}", e), thinking_collapsed: false, render_cache: crate::llm::RenderCache::default() });
                     app.is_thinking = false;
                     app.scroll_to_bottom();
                 }
@@ -959,9 +1026,9 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                     return;
                 }
 
-                app.messages.push(ChatMessage { role: "user".to_string(), content: user_input.clone(), thinking_collapsed: false });
+                app.messages.push(ChatMessage { role: "user".to_string(), content: user_input.clone(), thinking_collapsed: false, render_cache: crate::llm::RenderCache::default() });
                 // Placeholder for assistant
-                app.messages.push(ChatMessage { role: "assistant".to_string(), content: String::new(), thinking_collapsed: false });
+                app.messages.push(ChatMessage { role: "assistant".to_string(), content: String::new(), thinking_collapsed: false, render_cache: crate::llm::RenderCache::default() });
                 app.scroll_to_bottom();
                 app.is_thinking = true;
                 app.status_message = None;
@@ -1036,6 +1103,7 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                  if let Some(last) = app.messages.last_mut() {
                      if last.role == "assistant" {
                          last.thinking_collapsed = !last.thinking_collapsed;
+                         last.render_cache.inner = None;
                          let msg = format!(" Thinking Process: {} ", if last.thinking_collapsed { "HIDDEN" } else { "SHOWN" });
                          app.status_message = Some(msg);
                          app.status_message_time = Some(Instant::now());
