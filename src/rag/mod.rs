@@ -1,10 +1,12 @@
 pub mod embeddings;
 pub mod store;
+pub mod hnsw_store;
 
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::rag::store::VectorStore;
+use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Document {
@@ -64,7 +66,30 @@ impl RagStats {
 impl RagSystem {
     pub fn new(storage_path: &str) -> anyhow::Result<Self> {
         let embedder = Arc::new(embeddings::EmbeddingModel::new()?);
-        let store = store::LinearVectorStore::new(storage_path)?;
+        
+        // Check if HNSW index exists
+        let hnsw_path = Path::new(storage_path).with_extension("hnsw");
+        
+        let mut store = hnsw_store::HnswVectorStore::new(storage_path)?;
+        
+        // Migration logic: If HNSW didn't exist but Linear store does, migrate
+        if !hnsw_path.exists() && Path::new(storage_path).exists() {
+             tracing::info!("Migrating from Linear Store to HNSW Store...");
+             match store::LinearVectorStore::new(storage_path) {
+                 Ok(old_store) => {
+                     let docs = old_store.get_all()?;
+                     tracing::info!("Found {} documents to migrate.", docs.len());
+                     for doc in docs {
+                         store.add_document(doc)?;
+                     }
+                     store.save()?;
+                     tracing::info!("Migration complete.");
+                 },
+                 Err(e) => {
+                     tracing::warn!("Failed to open existing linear store for migration: {}", e);
+                 }
+             }
+        }
 
         Ok(Self {
             store: Arc::new(Mutex::new(Box::new(store))),
@@ -156,8 +181,8 @@ impl RagSystem {
             file_size_bytes: stats.file_size_bytes, 
             storage_path,
             store_type,
-            chunking_strategy: "Semantic (TextSplitter)".to_string(), // Currently hardcoded as we switched to it
-            embedding_model: "embedding-gemma-2b-Q4_0".to_string(), // Based on the embedded model file name
+            chunking_strategy: self.embedder.chunking_strategy(),
+            embedding_model: self.embedder.model_name(),
         }
     }
 

@@ -1,0 +1,180 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{longtable}
+
+\geometry{margin=1in}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{\textbf{PoliRag}}
+\author{0xbiel}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\newpage
+\tableofcontents
+\newpage
+
+\section{Introduction}
+PoliRag (PoliformaT Retrieval-Augmented Generation) is a comprehensive personal knowledge base application designed for students of the Universitat Politècnica de València (UPV). It bridges the gap between the university's Learning Management System (PoliformaT) and modern Large Language Models (LLMs). By automating the ingestion of course materials and providing a local, semantic search interface, PoliRag allows users to interact with their curriculum in natural language.
+
+The design philosophy emphasizes \textbf{local-first privacy}, \textbf{efficiency}, and \textbf{robustness}. No user data leaves the machine during the retrieval phase, and the system is designed to handle network instability and varied content formats.
+
+\section{System Architecture}
+The system is built in Rust, leveraging its memory safety and concurrency features. It follows a modular architecture where the core domain logic (RAG) is decoupled from the user interface (TUI) and data acquisition (Scraper).
+
+\subsection{High-Level Component Diagram}
+\begin{itemize}
+    \item \textbf{User Interface Layer}: Textual User Interface (TUI) built with \texttt{ratatui}.
+    \item \textbf{Application Layer}: Orchestrates the sync pipeline, query handling, and state management.
+    \item \textbf{Domain Layer}:
+        \begin{itemize}
+            \item \textbf{RAG Service}: Embeddings, Vector Search, Document Management.
+            \item \textbf{Scraper Service}: UPV PoliformaT Automation.
+        \end{itemize}
+    \item \textbf{Infrastructure Layer}:
+        \begin{itemize}
+            \item \textbf{HNSW Index}: On-disk vector storage.
+            \item \textbf{LLM Client}: HTTP client for OpenRouter/LM Studio.
+            \item \textbf{Config Store}: JSON based persistence with encryption.
+        \end{itemize}
+\end{itemize}
+
+\section{Detailed Component Analysis}
+
+\subsection{Scraper Module (\texttt{src/scrapper})}
+The scraper automation is powered by \texttt{headless\_chrome}, which controls a local Chrome instance via the DevTools Protocol (CDP).
+
+\subsubsection{Authentication \& Session Management}
+PoliformaT requires UPV Single Sign-On (SSO). PoliRag creates a robust session flow:
+\begin{enumerate}
+    \item \textbf{Credential Resolution}: Checks (1) Cached Config, (2) Environment Variables (\texttt{POLIFORMAT\_USER}).
+    \item \textbf{Headless Login}: 
+        \begin{itemize}
+            \item Navigates to the login portal.
+            \item Detects input fields dynamically (handling variable IDs like \texttt{\#username} vs \texttt{input[name='dni']}).
+            \item Submits credentials and waits for the \texttt{\#toolMenu} element to confirm success.
+        \end{itemize}
+    \item \textbf{Cookie Export}: Upon successful login, the scraper exports the browser cookies. These are shared with a \texttt{reqwest::Client} instance, enabling high-performance concurrent HTTP requests for subsequent operations that don't require JavaScript rendering.
+\end{enumerate}
+
+\subsubsection{Parallel Execution Strategy}
+While navigating subjects is sequential (to manage the browser's download behavior context safely), content extraction within a subject utilizes hybrid blocking/async tasks.
+\begin{itemize}
+    \item \textbf{Subject Discovery}: Executes a JS snippet in the browser context to parse the DOM and extract all subject URLs, deduplicating them.
+    \item \textbf{Download Management}: The scraper uses \texttt{Page.setDownloadBehavior} to redirect downloads to a per-subject directory. It monitors file system events (presence of \texttt{.crdownload} files) to ensure completion.
+\end{itemize}
+
+\subsection{RAG Engine (\texttt{src/rag})}
+The core of PoliRag is its vector search capabilities.
+
+\subsubsection{Embedding Model}
+PoliRag embeds a quantized 300M parameter model directly into the binary using the \texttt{embed\_model!} macro.
+\begin{itemize}
+    \item \textbf{Model}: \texttt{google/embedding-gemma-300m-Q4\_0.gguf}.
+    \item \textbf{Engine}: \texttt{llama.cpp} bindings.
+    \item \textbf{Hardware Acceleration}: On macOS, the system offloads all 999 layers to Metal (GPU), ensuring extremely fast inference.
+    \item \textbf{Chunking Strategy}: Uses \texttt{text-splitter} with a max chunk size of 512 tokens (approx. 1024 characters). It creates overlapping semantic chunks to preserve context at boundaries.
+\end{itemize}
+
+\subsubsection{Vector Storage (HNSW)}
+Instead of a linear scan, PoliRag uses Hierarchical Navigable Small World (HNSW) graphs via the \texttt{hnsw\_rs} crate.
+\begin{itemize}
+    \item \textbf{Algorithm}: Constructs a multi-layer graph where higher layers act as expressways for search, descending to lower layers for precision.
+    \item \textbf{Parameters}: M=24 (max links per node), ef\_construction=10000 (candidates during build).
+    \item \textbf{Persistence}: The index is serialized to two files:
+        \begin{itemize}
+            \item \texttt{.hnsw.graph}: The graph structure.
+            \item \texttt{.data}: The document content and metadata (managed via \texttt{bincode}).
+        \end{itemize}
+\end{itemize}
+
+\subsection{TUI \& Event Loop (\texttt{src/tui})}
+The interface follows a reactor pattern.
+
+\subsubsection{Async Architecture}
+The main thread runs the UI render loop. Heavy operations (LLM generation, Sync) are offloaded to \texttt{tokio} tasks which communicate results back via \texttt{mpsc} channels.
+\begin{itemize}
+    \item \texttt{tx\_llm / rx\_llm}: Stream tokens from the LLM.
+    \item \texttt{tx\_sync / rx\_sync}: Stream log messages during the scraping process.
+\end{itemize}
+
+\subsubsection{Rendering Pipeline}
+\begin{itemize}
+    \item \textbf{Markdown Caching}: Because re-parsing markdown every frame is expensive, the \texttt{ChatMessage} struct caches the rendered cell layout.
+    \item \textbf{Throbber}: An animated state indicator provides visual feedback for background processes without blocking input.
+    \item \textbf{Thinking Blocks}: Special handling for \texttt{<think>} tags from reasoning models allows the UI to collapse/expand chain-of-thought traces.
+\end{itemize}
+
+\section{Data Structures}
+
+\subsection{Document}
+The foundational unit of the knowledge base.
+\begin{lstlisting}[language=Rust]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Document {
+    pub id: String,                 // Unique URI (e.g., subject_id/file_path)
+    pub content: String,            // The raw text content
+    pub embedding: Vec<f32>,        // High-dimensional vector
+    pub metadata: HashMap<String, String>, // Key-values: type, user_id, timestamp
+    pub user_id: String,            // Multi-user support field
+}
+\end{lstlisting}
+
+\subsection{Configuration}
+Stored in standard OS locations (e.g., \texttt{\textasciitilde/Library/Application Support/polirag/config.json} on macOS).
+\begin{lstlisting}[language=Rust]
+pub struct Config {
+    pub last_model: Option<String>,
+    pub cached_credentials: Option<EncryptedCredentials>, // Simple XOR + Base64
+    pub llm_provider: LlmProvider, // LmStudio | OpenRouter
+    // ...
+}
+\end{lstlisting}
+
+\section{Error Handling \& Security}
+\begin{itemize}
+    \item \textbf{Credential Security}: Credentials are not stored in plain text. A simple XOR encryption with a hardcoded key obfuscates them on disk, preventing casual snooping (though not robust against determined attackers with binary access).
+    \item \textbf{Graceful Degradation}: If the HNSW index is corrupted or missing, the system attempts to rebuild it or start fresh rather than crashing.
+    \item \textbf{Network Resilience}: The scraper includes retry logic for finding DOM elements, handling the slow loading times of the university portal.
+\end{itemize}
+
+\section{Future Improvements}
+\begin{itemize}
+    \item \textbf{Hybrid Search}: Combine dense vector retrieval with BM25 keyword search for better exact-match performance (e.g., searching for specific acronyms).
+    \item \textbf{File Watcher}: Automatically re-index files when they are modified in the local \texttt{data/} directory.
+\end{itemize}
+
+\end{document}

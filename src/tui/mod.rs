@@ -113,7 +113,7 @@ impl TuiApp {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions. IMPORTANT: You MUST answer in the same language as the user's message (e.g. if user asks in Catalan, answer in Catalan; if in English, answer in English), even if the retrieved documents are in Spanish.".to_string(),
+                    content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions. breakdown\n\nIMPORTANT INSTRUCTIONS:\n1. You MUST answer in the same language as the user's message (e.g. if user asks in Catalan, answer in Catalan).\n2. You MUST cite the source document ID for every claim you make based on the context.\n3. Use the format `[doc_id]` at the end of the sentence or paragraph.\n   - Example: \"The exam is on Friday [GRA_11673_2025/guide.pdf].\"\n   - The document ID is provided in the context blocks as `[source_id]: content`.".to_string(),
                     thinking_collapsed: false,
                     render_cache: crate::llm::RenderCache::default(),
                 }

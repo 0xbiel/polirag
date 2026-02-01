@@ -11,7 +11,15 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::AddBos;
 
 // Embed the model directly into the binary
-const MODEL_BYTES: &[u8] = include_bytes!("../../embeddinggemma-300m-Q4_0.gguf");
+// Macro to embed model and keep track of path
+macro_rules! embed_model {
+    ($path:literal) => {
+        const MODEL_BYTES: &[u8] = include_bytes!($path);
+        const MODEL_PATH: &str = $path;
+    }
+}
+
+embed_model!("../../embeddinggemma-300m-Q4_0.gguf");
 
 struct LlamaState {
     // We keep the backend alive
@@ -201,5 +209,17 @@ impl EmbeddingModel {
             .map(|s: &str| s.to_string())
             .collect()
     }
-    
+
+    pub fn model_name(&self) -> String {
+        std::path::Path::new(MODEL_PATH)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown_model")
+            .to_string()
+    }
+
+    pub fn chunking_strategy(&self) -> String {
+        format!("Semantic (TextSplitter) - {} chars", MAX_CHUNK_CHARS)
+    }
 }
+

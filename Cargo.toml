@@ -58,6 +58,7 @@ tui-markdown = "0.3.7"
 pulldown-cmark = "0.13.0"
 ratatui-core = "0.1.0"
 textwrap = "0.16.2"
+hnsw_rs = "0.3"
 # hf-hub = "0.3"
 
 [profile.release]

@@ -2,118 +2,81 @@
 
 _By 0xbiel_
 
-## Abstract
+![PoliRag TUI](https://raw.githubusercontent.com/0xbiel/polirag/main/assets/demo.png)
 
-PoliRag is a Retrieval-Augmented Generation (RAG) system designed to turn a user’s PoliformaT course content (subjects, announcements, lesson pages, teaching guides, and downloaded resources like PDFs) into a searchable personal knowledge base. At query time, PoliRag retrieves the most relevant snippets from that knowledge base and provides them as grounded context to a language model, improving factuality and reducing hallucinations compared to prompting without retrieval.
+## Overview
 
-## What is PoliRag?
+**PoliRag** turns your university course content into an interactive, queriable knowledge base. It automates the extraction of subjects, announcements, lessons, and resources from the **PoliformaT** platform (UPV) and powers a local RAG (Retrieval-Augmented Generation) system.
 
-PoliRag combines three components:
+Chat with your subjects directly from the terminal, with answers grounded in your specific teaching guides and uploaded documents.
 
-1. **Ingestion (scraping + extraction)**. Content is collected from PoliformaT via a headless browser flow and via authenticated HTTP requests using imported session cookies. Downloaded resources (e.g., zip bundles of course files) are unpacked and PDFs are extracted to clean text.
-2. **Indexing (embeddings + vector store)**. Each document is embedded into a fixed-length vector using a local embedding model. Documents, metadata, and embeddings are stored on disk in a compact serialized vector index.
-3. **Retrieval (semantic search + snippets)**. A user query is embedded, compared against stored document embeddings using cosine similarity, and the top matches are turned into concise snippets suitable for LLM context.
+## Key Features
 
-The design goal is a personal, offline-first RAG workflow: embeddings are computed locally, and the on-disk index can be rebuilt or re-embedded when the embedding model changes.
+- **🚀 Automated Scraping**: Headless browser automation (Chrome) handles UPV SSO login and extracts content from all your enrolled subjects.
+- **🧠 Local RAG Pipeline**:
+  - **Embeddings**: Uses `embeddinggemma-300m` locally (no API costs).
+  - **Vector Store**: High-performance **HNSW** (Hierarchical Navigable Small World) index for instant retrieval.
+  - **Privacy**: All documents and embeddings stay on your machine.
+- **🖥️ Advanced TUI**:
+  - Built with `ratatui` for a responsive, keyboard-driven experience.
+  - **Markdown Streaming**: Smooth text rendering with syntax highlighting.
+  - **Thinking Process**: Native support for reasoning models (e.g., DeepSeek R1) with collapsible thought blocks.
+  - **Async Architecture**: UI never freezes during scraping or inference.
+- **🤖 LLM Flexibility**: Connects to:
+  - **LM Studio** (Local inference)
+  - **OpenRouter** (Cloud inference)
 
-## Setup
+## Installation & Setup
 
-### Download the Embedding Model
+### 1. Prerequisites
+- **Rust Toolchain**: `cargo` installed.
+- **Google Chrome**: Required for the headless scraper.
 
-PoliRag requires a local embedding model to function. Download the `embeddinggemma-300m-Q4_0.gguf` file and place it in the root directory of the project:
+### 2. Download the Embedding Model
+PoliRag uses a local GGUF model for embedding generation. Download `embeddinggemma-300m-Q4_0.gguf` to the project root:
 
 ```bash
-# Download from Hugging Face
+# Using wget
 wget https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf
 
-# Or use curl
+# Or using curl
 curl -L -o embeddinggemma-300m-Q4_0.gguf https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf
 ```
-
 > [!NOTE]
-> This file is approximately 265 MB and is required for the RAG system to generate embeddings.
+> File size: ~265 MB.
 
-## Configuration, CLI, and Operations
-
-### Configuration (`config.rs`)
-
-PoliRag persists user settings and cached credentials in a JSON config file stored under the OS application data directory (e.g., via `dirs::data_dir()`). Credentials are stored as an encrypted blob (XOR + base64) so they are not plain-text on disk.
-
-The configuration also tracks which LLM backend to use (LM Studio local endpoint vs OpenRouter), plus the most recently selected model.
-
-```rust
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
-pub enum LlmProvider {
-    #[default]
-    LmStudio,
-    OpenRouter,
-}
-
-impl LlmProvider {
-    pub fn base_url(&self) -> &'static str {
-        match self {
-            LlmProvider::LmStudio => "http://localhost:1234/v1",
-            LlmProvider::OpenRouter => "https://openrouter.ai/api/v1",
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Default)]
-pub struct Config {
-    pub last_model: Option<String>,
-    pub cached_credentials: Option<EncryptedCredentials>,
-    pub llm_provider: LlmProvider,
-    pub openrouter_api_key: Option<String>,
-    pub openrouter_model: Option<String>,
-}
+### 3. Build and Run
+```bash
+cargo run --release
 ```
 
-### Entrypoint and Commands (`main.rs`)
+## Usage
 
-The application exposes a small CLI with `clap`:
+### 🔄 Sync Data
+Select **Sync Data** from the main menu. PoliRag will:
+1. Launch a headless browser.
+2. Log in to PoliformaT (you may need to approve 2FA on your phone).
+3. Scrape your subjects and download PDF/ZIP resources.
+4. Process and index all text into the local HNSW vector store.
 
-- **Menu**: The default interactive terminal UI.
-- **Sync**: A headless scrape + index build suitable for cron/automation.
-- **ExtractPdf**: An internal subcommand used to isolate PDF text extraction into a subprocess.
+### 💬 Chat
+Select **Chat with Assistant**.
+- **Ask questions** about your subjects (e.g., "What is the evaluation method for IAP?").
+- **Collapsible Thinking**: Toggle the "Thinking" block visibility with `Ctrl+T` (if using a reasoning model).
+- **History**: Scroll up/down to view past context.
 
-On startup, PoliRag initializes logging, loads the vector index path from the global config directory, and initializes the RAG, scraper, and LLM client.
+### ⚙️ Configuration
+Credentials and settings are stored locally in your OS data directory.
+- **Provider**: Toggle between Local (LM Studio) and Cloud (OpenRouter).
+- **Models**: Enter your preferred model name (e.g., `deepseek/deepseek-r1`).
 
-```rust
-#[derive(Subcommand, Clone)]
-enum Commands {
-    Sync,
-    Menu,
-    #[command(hide = true)]
-    ExtractPdf { path: String },
-}
-```
+## Technical Architecture
 
-### Sync Pipeline (`ops.rs`)
+For a deep dive into the system internals, see [project_docs.tex](./project_docs.tex).
 
-The sync operation is responsible for ensuring authentication (cached credentials or environment variables), clearing prior state, scraping subjects, extracting resources, and finally adding documents to the vector index.
+- **Scraper**: `headless_chrome` + `reqwest` (cookie sharing).
+- **Vector DB**: `hnsw_rs`.
+- **UI**: `ratatui` + `crossterm` + Custom Markdown Renderer.
 
-```rust
-pub async fn run_sync(rag: Arc<rag::RagSystem>, poliformat: Arc<scrapper::PoliformatClient>)
-    -> anyhow::Result<()>
-{
-    if !poliformat.check_connection().await.unwrap_or(false) {
-        // try cached credentials; fall back to env vars
-        // perform headless login (blocking)
-    }
-    rag.clear()?;
-    let subjects = poliformat.get_subjects().await?;
-    let detailed = poliformat.scrape_subject_content(subjects).await?;
-    
-    for (sub, dir_path) in detailed {
-        // read summary.md, process PDFs, add documents with metadata
-        // rag.add_document(...).await?;
-    }
-    Ok(())
-}
-```
-
-## Limitations and Next Steps
-
-- **Index scalability**: The current approach is linear scan; a future upgrade could add ANN (HNSW) for very large corpora.
-- **Chunking quality**: Word-based chunking is a heuristic; sentence/semantic chunking often improves retrieval.
-- **Grounding UX**: Adding explicit per-snippet source identifiers and timestamps would make answers easier to trust.
+## License
+MIT
