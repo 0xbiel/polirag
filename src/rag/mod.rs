@@ -1,10 +1,12 @@
 pub mod embeddings;
+pub mod store;
+pub mod hnsw_store;
 
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use crate::rag::store::VectorStore;
+use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Document {
@@ -15,15 +17,9 @@ pub struct Document {
     pub user_id: String,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct VectorIndex {
-    documents: Vec<Document>,
-}
-
 pub struct RagSystem {
-    db: Arc<Mutex<VectorIndex>>,
+    store: Arc<Mutex<Box<dyn VectorStore>>>,
     embedder: Arc<embeddings::EmbeddingModel>,
-    storage_path: String,
 }
 
 /// Statistics about the RAG index
@@ -34,6 +30,9 @@ pub struct RagStats {
     pub embedding_dimensions: usize,
     pub file_size_bytes: u64,
     pub storage_path: String,
+    pub store_type: String,
+    pub chunking_strategy: String,
+    pub embedding_model: String,
 }
 
 impl RagStats {
@@ -68,18 +67,33 @@ impl RagSystem {
     pub fn new(storage_path: &str) -> anyhow::Result<Self> {
         let embedder = Arc::new(embeddings::EmbeddingModel::new()?);
         
-        let db = if std::path::Path::new(storage_path).exists() {
-            let file = File::open(storage_path)?;
-            let reader = BufReader::new(file);
-            bincode::deserialize_from(reader).unwrap_or_default()
-        } else {
-            VectorIndex::default()
-        };
+        // Check if HNSW index exists
+        let hnsw_path = Path::new(storage_path).with_extension("hnsw");
+        
+        let mut store = hnsw_store::HnswVectorStore::new(storage_path)?;
+        
+        // Migration logic: If HNSW didn't exist but Linear store does, migrate
+        if !hnsw_path.exists() && Path::new(storage_path).exists() {
+             tracing::info!("Migrating from Linear Store to HNSW Store...");
+             match store::LinearVectorStore::new(storage_path) {
+                 Ok(old_store) => {
+                     let docs = old_store.get_all()?;
+                     tracing::info!("Found {} documents to migrate.", docs.len());
+                     for doc in docs {
+                         store.add_document(doc)?;
+                     }
+                     store.save()?;
+                     tracing::info!("Migration complete.");
+                 },
+                 Err(e) => {
+                     tracing::warn!("Failed to open existing linear store for migration: {}", e);
+                 }
+             }
+        }
 
         Ok(Self {
-            db: Arc::new(Mutex::new(db)),
+            store: Arc::new(Mutex::new(Box::new(store))),
             embedder,
-            storage_path: storage_path.to_string(),
         })
     }
 
@@ -94,172 +108,164 @@ impl RagSystem {
             user_id: user_id.to_string(),
         };
 
-        let mut db = self.db.lock().unwrap();
-        db.documents.retain(|d| d.id != id);
-        db.documents.push(doc);
-        
-        self.save_internal(&db)?;
+        let mut store = self.store.lock().unwrap();
+        store.add_document(doc)?;
         Ok(())
     }
 
     pub fn count_documents(&self) -> usize {
-        self.db.lock().unwrap().documents.len()
+        self.store.lock().unwrap().count()
     }
 
     /// Clear all documents from the index
     pub fn clear(&self) -> anyhow::Result<()> {
-        let mut db = self.db.lock().unwrap();
-        db.documents.clear();
-        self.save_internal(&db)?;
-        Ok(())
+        let mut store = self.store.lock().unwrap();
+        store.clear()
+    }
+
+    /// Check if a document exists in the index
+    pub fn contains(&self, id: &str) -> bool {
+        self.store.lock().unwrap().contains(id)
+    }
+
+    /// Save the index to disk
+    pub fn save(&self) -> anyhow::Result<()> {
+        let store = self.store.lock().unwrap();
+        store.save()
+    }
+    
+    /// Remove a document from the index
+    pub fn remove_document(&self, id: &str) -> anyhow::Result<()> {
+        let mut store = self.store.lock().unwrap();
+        store.remove_document(id)
+    }
+
+    /// Get all chunks for a specific file, sorted by index
+    pub fn get_file_chunks(&self, filename: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let store = self.store.lock().unwrap();
+        let mut chunks = store.get_documents_by_metadata("filename", filename)?;
+        
+        // Sort by ID to ensure correct part order (assuming part index is in ID)
+        // IDs are formatted as "subject/path#index"
+        chunks.sort_by(|a, b| {
+            let get_idx = |id: &str| -> usize {
+                id.split('#').last().and_then(|s| s.parse().ok()).unwrap_or(0)
+            };
+            get_idx(&a.id).cmp(&get_idx(&b.id))
+        });
+        
+        Ok(chunks.into_iter().map(|d| (d.id, d.content)).collect())
+    }
+
+    /// Get a list of all unique filenames in the index
+    pub fn get_all_filenames(&self) -> anyhow::Result<HashSet<String>> {
+        let store = self.store.lock().unwrap();
+        let docs = store.get_all()?;
+        let mut filenames = HashSet::new();
+        for doc in docs {
+            if let Some(filename) = doc.metadata.get("filename") {
+                filenames.insert(filename.clone());
+            }
+        }
+        Ok(filenames)
     }
     
     /// Recalculate embeddings for all documents
     /// progress_fn receives (current, total, doc_id, metadata)
-    pub async fn reembed_all<F>(&self, mut progress_fn: F) -> anyhow::Result<usize>
+    /// skip_ids allows avoiding redundant work for documents already indexed in this run
+    pub async fn reembed_all<F>(&self, skip_ids: &HashSet<String>, mut progress_fn: F) -> anyhow::Result<usize>
     where
         F: FnMut(usize, usize, &str, &HashMap<String, String>),
     {
         // Get all document contents
-        let docs_data: Vec<(String, String, String, HashMap<String, String>)> = {
-            let db = self.db.lock().unwrap();
-            db.documents.iter()
-                .map(|d| (d.id.clone(), d.content.clone(), d.user_id.clone(), d.metadata.clone()))
-                .collect()
+        let docs = {
+            let store = self.store.lock().unwrap();
+            store.get_all()?
         };
         
-        let total = docs_data.len();
+        let total = docs.len();
         let mut reembedded = 0;
         
-        for (i, (id, content, user_id, metadata)) in docs_data.into_iter().enumerate() {
-            progress_fn(i + 1, total, &id, &metadata);
+        for (i, old_doc) in docs.into_iter().enumerate() {
+            if skip_ids.contains(&old_doc.id) {
+                reembedded += 1;
+                progress_fn(i + 1, total, &old_doc.id, &old_doc.metadata);
+                continue;
+            }
+            
+            progress_fn(i + 1, total, &old_doc.id, &old_doc.metadata);
             
             // Recalculate embedding
-            let embedding_res = self.embedder.embed(&content).await;
+            let embedding_res = self.embedder.embed(&old_doc.content).await;
             
             match embedding_res {
                 Ok(embedding) => {
                     // Update document
-                    let doc = Document {
-                        id: id.clone(),
-                        content,
-                        embedding,
-                        metadata,
-                        user_id,
-                    };
+                    let mut doc = old_doc.clone();
+                    doc.embedding = embedding;
                     
-                    let mut db = self.db.lock().unwrap();
-                    db.documents.retain(|d| d.id != id);
-                    db.documents.push(doc);
+                    let mut store = self.store.lock().unwrap();
+                    store.add_document(doc)?;
                     reembedded += 1;
                 },
                 Err(e) => {
-                    tracing::error!("Failed to re-embed output document {}: {}", id, e);
-                    // Continue to next document
+                    tracing::error!("Failed to re-embed output document {}: {}", old_doc.id, e);
                 }
             }
         }
         
-        // Save at the end
-        let db = self.db.lock().unwrap();
-        self.save_internal(&db)?;
+        let store = self.store.lock().unwrap();
+        store.save()?;
         
         Ok(reembedded)
     }
 
     /// Get comprehensive statistics about the RAG index
     pub fn get_stats(&self) -> RagStats {
-        let db = self.db.lock().unwrap();
-        
-        // Count documents by type
-        let mut docs_by_type: HashMap<String, usize> = HashMap::new();
-        let mut total_content_bytes: usize = 0;
-        let mut total_embedding_dims: usize = 0;
-        
-        for doc in &db.documents {
-            total_content_bytes += doc.content.len();
-            total_embedding_dims = doc.embedding.len(); // All same dimension
-            
-            let doc_type = doc.metadata.get("type").cloned().unwrap_or_else(|| "unknown".to_string());
-            *docs_by_type.entry(doc_type).or_insert(0) += 1;
-        }
-        
-        // Get file size on disk
-        let file_size_bytes = std::fs::metadata(&self.storage_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let store = self.store.lock().unwrap();
+        let stats = store.get_stats();
+        let storage_path = store.storage_path();
+        let store_type = store.store_type();
         
         RagStats {
-            document_count: db.documents.len(),
-            docs_by_type,
-            total_content_bytes,
-            embedding_dimensions: total_embedding_dims,
-            file_size_bytes,
-            storage_path: self.storage_path.clone(),
+            document_count: stats.document_count,
+            docs_by_type: stats.docs_by_type,
+            total_content_bytes: stats.total_content_bytes,
+            embedding_dimensions: stats.embedding_dimensions,
+            file_size_bytes: stats.file_size_bytes, 
+            storage_path,
+            store_type,
+            chunking_strategy: self.embedder.chunking_strategy(),
+            embedding_model: self.embedder.model_name(),
         }
     }
 
     pub async fn search(&self, query: &str, user_id: &str, top_k: usize) -> anyhow::Result<Vec<(Document, f32)>> {
-        // Embed the query
         let query_embedding = self.embedder.embed(query).await?;
-        let db = self.db.lock().unwrap();
-        
-        let mut scores: Vec<(Document, f32)> = db.documents.iter()
-            .filter(|d| d.user_id == user_id)
-            .map(|d| {
-                let score = cosine_similarity(&query_embedding, &d.embedding);
-                (d.clone(), score)
-            })
-            .collect();
-            
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(top_k);
-        
-        Ok(scores)
+        let store = self.store.lock().unwrap();
+        store.search(&query_embedding, user_id, top_k, 0.0)
     }
     
     /// Search and return concise snippets suitable for LLM context
-    /// Returns ALL documents above relevance threshold, not limited by top_k
     pub async fn search_snippets(&self, query: &str, user_id: &str, top_k: usize) -> anyhow::Result<Vec<(String, String, f32)>> {
-        // Get all documents, not limited
         let query_embedding = self.embedder.embed(query).await?;
-        let db = self.db.lock().unwrap();
         
-        let mut scores: Vec<(Document, f32)> = db.documents.iter()
-            .filter(|d| d.user_id == user_id)
-            .map(|d| {
-                let score = cosine_similarity(&query_embedding, &d.embedding);
-                (d.clone(), score)
-            })
-            .collect();
-            
-        tracing::debug!("RAG Search: Found {} candidates (pre-filter)", scores.len());
+        let candidates = {
+            let store = self.store.lock().unwrap();
+            store.search(&query_embedding, user_id, top_k * 2, 0.3)?
+        };
         
-        // Log top 5 scores for debugging
-        let mut sorted_scores: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
-        sorted_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        if !sorted_scores.is_empty() {
-            let top_5: Vec<f32> = sorted_scores.iter().take(5).copied().collect();
+        tracing::debug!("RAG Search: Found {} candidates (pre-filter)", candidates.len());
+        
+        if !candidates.is_empty() {
+            let top_5: Vec<f32> = candidates.iter().take(5).map(|(_,s)| *s).collect();
             tracing::info!("RAG Search: Top 5 scores: {:?}", top_5);
-        }
-        
-        // Filter out low-relevance results
-        // With working embeddings, 0.3 is a reasonable threshold for semantic similarity
-        let min_threshold = 0.3;
-        scores.retain(|(_, score)| *score > min_threshold);
-        
-        tracing::debug!("RAG Search: {} candidates passed threshold > {}", scores.len(), min_threshold);
-            
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
-        if scores.len() > top_k {
-            scores.truncate(top_k);
         }
         
         let query_lower = query.to_lowercase();
         let query_words: Vec<String> = query_lower.split_whitespace().map(|s| s.to_string()).collect();
         
-        let snippets: Vec<(String, String, f32)> = scores.into_iter()
+        let mut snippets: Vec<(String, String, f32)> = candidates.into_iter()
             .map(|(doc, score)| {
                 let source = doc.metadata.get("type")
                     .map(|t| {
@@ -275,41 +281,22 @@ impl RagSystem {
                 (source, snippet, score)
             })
             .collect();
+            
+        if snippets.len() > top_k {
+            snippets.truncate(top_k);
+        }
         
         Ok(snippets)
-    }
-    fn save_internal(&self, idx: &VectorIndex) -> anyhow::Result<()> {
-        let file = File::create(&self.storage_path)?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, idx)?;
-        Ok(())
-    }
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot_product: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    
-    if norm_a == 0.0 || norm_b == 0.0 {
-        // Log when we get zero norm - this helps debug
-        tracing::trace!("cosine_similarity: norm_a={:.4}, norm_b={:.4}, dims=({}, {})", 
-                       norm_a, norm_b, a.len(), b.len());
-        0.0
-    } else {
-        dot_product / (norm_a * norm_b)
     }
 }
 
 /// Extract the most relevant snippet from content based on query words
 fn extract_relevant_snippet(content: &str, query_words: &[String], max_chars: usize) -> String {
-    // Find the best starting position based on query word matches
     let mut best_pos = 0;
     let mut best_score = 0;
     
-    // Scan through content in chunks looking for query word density
     let words: Vec<&str> = content.split_whitespace().collect();
-    let window_size = 50; // words
+    let window_size = 50; 
     
     for i in 0..words.len().saturating_sub(window_size) {
         let window: String = words[i..i + window_size].join(" ").to_lowercase();
@@ -319,20 +306,16 @@ fn extract_relevant_snippet(content: &str, query_words: &[String], max_chars: us
         
         if score > best_score {
             best_score = score;
-            // Calculate character position
             best_pos = words[..i].iter().map(|w| w.len() + 1).sum::<usize>();
         }
     }
     
-    // Extract snippet around best position
     let start = best_pos.saturating_sub(50);
     let end = (start + max_chars).min(content.len());
     
     let mut snippet: String = content.chars().skip(start).take(end - start).collect();
     
-    // Clean up the snippet
     if start > 0 {
-        // Trim to first word boundary
         if let Some(pos) = snippet.find(' ') {
             snippet = snippet[pos + 1..].to_string();
         }
@@ -340,7 +323,6 @@ fn extract_relevant_snippet(content: &str, query_words: &[String], max_chars: us
     }
     
     if end < content.len() {
-        // Trim to last word boundary
         if let Some(pos) = snippet.rfind(' ') {
             snippet = snippet[..pos].to_string();
         }

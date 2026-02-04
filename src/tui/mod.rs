@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Alignment},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, List, ListItem, ListState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, List, ListItem, ListState, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::mpsc;
@@ -113,8 +113,9 @@ impl TuiApp {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions.".to_string(),
+                    content: "You are a helpful assistant with access to the user's university documents (PoliformaT). Use the provided context to answer questions. breakdown\n\nIMPORTANT INSTRUCTIONS:\n1. You MUST answer in the same language as the user's message (e.g. if user asks in Catalan, answer in Catalan).\n2. You MUST cite the source document ID for every claim you make based on the context.\n3. Use the format `[doc_id]` at the end of the sentence or paragraph.\n   - Example: \"The exam is on Friday [GRA_11673_2025/guide.pdf].\"\n   - The document ID is provided in the context blocks as `[source_id]: content`.".to_string(),
                     thinking_collapsed: false,
+                    render_cache: crate::llm::RenderCache::default(),
                 }
             ],
             input: String::new(),
@@ -260,7 +261,7 @@ fn render_logo() -> Vec<Line<'static>> {
 }
 
 fn draw_menu(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -315,7 +316,7 @@ fn draw_menu(frame: &mut Frame, app: &mut TuiApp) {
 }
 
 fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let outer_block = Block::default()
         .borders(Borders::ALL)
@@ -339,26 +340,87 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     app.viewport_height = messages_area.height;
     
     let max_width = messages_area.width.saturating_sub(4) as usize;
+    let mut total_height = 0;
     let mut lines: Vec<Line> = Vec::new();
     
-    for msg in &app.messages {
+    // Use mutable iteration to update render cache
+    for msg in &mut app.messages {
         match msg.role.as_str() {
             "user" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                let mut msg_lines = Vec::new();
+                let mut msg_height = 0;
+                
+                msg_lines.push(Line::from(""));
+                msg_lines.push(Line::from(vec![
                     Span::styled(" ▶ You ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
                 ]));
-                // Users messages are usually simple, but we can markdown them too
-                let rendered = markdown::render_markdown(&msg.content, max_width, false);
-                lines.extend(rendered);
+                msg_height += 2;
+                
+                // Check cache
+                let mut use_cache = false;
+                if let Some((cached_width, _, _)) = &msg.render_cache.inner {
+                    if *cached_width == max_width {
+                        use_cache = true;
+                    }
+                }
+                
+                if !use_cache {
+                    let rendered = markdown::render_markdown(&msg.content, max_width, false);
+                    // Calculate height for this message
+                    let mut rendered_height = 0;
+                    for line in &rendered {
+                         let line_str = line.to_string();
+                         let wrapped = textwrap::wrap(&line_str, max_width);
+                         rendered_height += wrapped.len().max(1);
+                    }
+                    msg.render_cache.inner = Some((max_width, rendered, rendered_height));
+                }
+                
+                if let Some((_, cached_lines, cached_height)) = &msg.render_cache.inner {
+                    msg_lines.extend(cached_lines.clone());
+                    msg_height += *cached_height;
+                }
+                
+                lines.extend(msg_lines);
+                total_height += msg_height;
             }
             "assistant" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                let mut msg_lines = Vec::new();
+                let mut msg_height = 0;
+                
+                msg_lines.push(Line::from(""));
+                msg_lines.push(Line::from(vec![
                     Span::styled(" ◆ Assistant ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 ]));
-                let rendered = markdown::render_markdown(&msg.content, max_width, msg.thinking_collapsed);
-                lines.extend(rendered);
+                msg_height += 2;
+                
+                 // Check cache
+                let mut use_cache = false;
+                if let Some((cached_width, _, _)) = &msg.render_cache.inner {
+                    if *cached_width == max_width {
+                        use_cache = true;
+                    }
+                }
+                
+                if !use_cache {
+                   let rendered = markdown::render_markdown(&msg.content, max_width, msg.thinking_collapsed);
+                   // Calculate height
+                   let mut rendered_height = 0;
+                   for line in &rendered {
+                        let line_str = line.to_string();
+                        let wrapped = textwrap::wrap(&line_str, max_width);
+                        rendered_height += wrapped.len().max(1);
+                   }
+                   msg.render_cache.inner = Some((max_width, rendered, rendered_height));
+                }
+                
+                if let Some((_, cached_lines, cached_height)) = &msg.render_cache.inner {
+                    msg_lines.extend(cached_lines.clone());
+                    msg_height += *cached_height;
+                }
+                
+                lines.extend(msg_lines);
+                total_height += msg_height;
             }
             _ => {}
         }
@@ -372,14 +434,35 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
         ]));
+        total_height += 2;
     }
 
-    app.content_height = lines.len() as u16;
+    // Estimate content height based on wrapping
+    // content_height = sum of visual lines
+    /*
+    let mut total_height = 0;
+    for line in &lines {
+        // Reconstruct string to measure wrapping (styles don't affect wrapping usually)
+        let mut full_line_str = String::new();
+        for span in &line.spans {
+            full_line_str.push_str(&span.content);
+        }
+        
+        let wrapped_lines = textwrap::wrap(&full_line_str, max_width);
+        // Ensure at least 1 line for empty strings? textwrap returns empty vec for empty string.
+        let output_lines = wrapped_lines.len().max(1);
+        total_height += output_lines;
+    }
+    */
+    app.content_height = total_height as u16;
+
     let max_scroll = app.content_height.saturating_sub(app.viewport_height);
     if app.follow_bottom { app.scroll_offset = max_scroll; }
     else if app.scroll_offset > max_scroll { app.scroll_offset = max_scroll; }
 
-    let messages = Paragraph::new(Text::from(lines)).scroll((app.scroll_offset, 0));
+    let messages = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset, 0));
     frame.render_widget(messages, messages_area);
 
     if app.content_height > app.viewport_height {
@@ -407,12 +490,12 @@ fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     if !app.is_thinking {
         let cursor_x = chunks[2].x + app.input_cursor as u16;
         let cursor_y = chunks[2].y + 1;
-        frame.set_cursor(cursor_x.min(chunks[2].x + chunks[2].width - 1), cursor_y);
+        frame.set_cursor_position((cursor_x.min(chunks[2].x + chunks[2].width - 1), cursor_y));
     }
 }
 
 fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -433,10 +516,13 @@ fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
     let content = if let Some(stats) = &app.rag_stats {
         let mut lines = vec![
             Line::from(""),
-            Line::from(vec![Span::styled("  📁 Storage Path:  ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.storage_path)]),
-            Line::from(vec![Span::styled("  💾 Index Size:    ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.format_file_size(), Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::styled("  📄 Documents:     ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.document_count.to_string(), Style::default().fg(Color::Yellow))]),
-            Line::from(vec![Span::styled("  📝 Content Size:  ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(stats.format_content_size())]),
+            Line::from(vec![Span::styled("  📁 Storage Path:    ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.storage_path)]),
+            Line::from(vec![Span::styled("  🗄️  Store Type:      ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(&stats.store_type, Style::default().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled("  ✂️  Chunking:        ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.chunking_strategy)]),
+            Line::from(vec![Span::styled("  🧠 Embedding Model: ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&stats.embedding_model)]),
+            Line::from(vec![Span::styled("  💾 Index Size:      ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.format_file_size(), Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled("  📄 Documents:       ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(stats.document_count.to_string(), Style::default().fg(Color::Yellow))]),
+            Line::from(vec![Span::styled("  📝 Content Size:    ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(stats.format_content_size())]),
             Line::from(""),
             Line::from(Span::styled("  Documents by Type:", Style::default().add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED))),
         ];
@@ -457,23 +543,33 @@ fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
             .alignment(Alignment::Center);
         frame.render_widget(progress, button_area);
     } else {
-        let button = Paragraph::new("  ▶ [R] Recalculate Embeddings  ")
+        let buttons_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(button_area);
+
+        let reembed_button = Paragraph::new("  ▶ [R] Recalculate  ")
             .style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
             .alignment(Alignment::Center);
-        frame.render_widget(button, button_area);
+        frame.render_widget(reembed_button, buttons_layout[0]);
+
+        let clear_button = Paragraph::new("  🗑 [C] Clear Index  ")
+            .style(Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center);
+        frame.render_widget(clear_button, buttons_layout[1]);
     }
     
     let instr_text = if app.reembed_running { 
         "Recalculating embeddings..." 
     } else { 
-        "R Recalculate │ Esc Menu" 
+        "Esc Menu" 
     };
     let instr = Paragraph::new(instr_text).style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center);
     frame.render_widget(instr, layout[4]);
 }
 
 fn draw_login(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)).title(" Login to PoliformaT ");
     let inner_area = block.inner(size);
@@ -510,14 +606,14 @@ fn draw_login(frame: &mut Frame, app: &mut TuiApp) {
         } else {
             (form_layout_pin[1].x + app.login_pin.len() as u16 + 1, form_layout_pin[1].y + 1)
         };
-        frame.set_cursor(cursor_x, cursor_y);
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
     
     frame.render_widget(Paragraph::new("Tab Switch Field │ Enter Submit │ Esc Cancel").style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center), layout[7]);
 }
 
 fn draw_sync(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let title = if app.sync_running {
         format!(" Syncing... {} ", THROBBER_FRAMES[app.throbber_frame])
@@ -573,7 +669,7 @@ fn draw_sync(frame: &mut Frame, app: &mut TuiApp) {
 }
 
 fn _draw_settings_old(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)
@@ -719,7 +815,7 @@ pub async fn run_app(state: Arc<AppState>) -> anyhow::Result<()> {
         terminal.draw(|f| draw(f, &mut app))?;
 
         // Check LLM results
-        if let Ok(result) = rx_llm.try_recv() {
+        while let Ok(result) = rx_llm.try_recv() {
             match result {
                 LlmResult::StreamChunk(event) => {
                     match event {
@@ -727,6 +823,7 @@ pub async fn run_app(state: Arc<AppState>) -> anyhow::Result<()> {
                              if let Some(last) = app.messages.last_mut() {
                                 if last.role == "assistant" {
                                     last.content.push_str(&chunk);
+                                    last.render_cache.inner = None;
                                 }
                             }
                             app.follow_bottom = true;
@@ -742,11 +839,12 @@ pub async fn run_app(state: Arc<AppState>) -> anyhow::Result<()> {
                     if let Some(last) = app.messages.last_mut() {
                          if last.role == "assistant" {
                              last.content = last.content.trim().to_string();
+                             last.render_cache.inner = None;
                          }
                     }
                 }
                 LlmResult::Error(e) => {
-                    app.messages.push(ChatMessage { role: "assistant".to_string(), content: format!("Error: {}", e), thinking_collapsed: false });
+                    app.messages.push(ChatMessage { role: "assistant".to_string(), content: format!("Error: {}", e), thinking_collapsed: false, render_cache: crate::llm::RenderCache::default() });
                     app.is_thinking = false;
                     app.scroll_to_bottom();
                 }
@@ -938,9 +1036,9 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                     return;
                 }
 
-                app.messages.push(ChatMessage { role: "user".to_string(), content: user_input.clone(), thinking_collapsed: false });
+                app.messages.push(ChatMessage { role: "user".to_string(), content: user_input.clone(), thinking_collapsed: false, render_cache: crate::llm::RenderCache::default() });
                 // Placeholder for assistant
-                app.messages.push(ChatMessage { role: "assistant".to_string(), content: String::new(), thinking_collapsed: false });
+                app.messages.push(ChatMessage { role: "assistant".to_string(), content: String::new(), thinking_collapsed: false, render_cache: crate::llm::RenderCache::default() });
                 app.scroll_to_bottom();
                 app.is_thinking = true;
                 app.status_message = None;
@@ -951,8 +1049,58 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                 let messages = app.messages.clone();
                 
                 tokio::spawn(async move {
-                    // Fetch more results for better coverage
-                    let snippets = rag.search_snippets(&user_input, "user", 10).await.unwrap_or_default();
+                    // 1. Detect explicit file mentions (e.g. .pdf or filename stems)
+                    let mut extra_context = String::new();
+                    let words: Vec<&str> = user_input.split_whitespace().collect();
+                    
+                    let all_filenames = rag.get_all_filenames().unwrap_or_default();
+                    let mut mentioned_targets = Vec::new();
+
+                    for word in words {
+                        let word_clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-');
+                        if word_clean.len() < 4 { continue; } // Skip short common words
+                        
+                        let word_lower = word_clean.to_lowercase();
+                        
+                        // Check for direct match or stem match
+                        for filename in &all_filenames {
+                            let filename_lower = filename.to_lowercase();
+                            let stem = if let Some(pos) = filename_lower.find(".pdf") {
+                                &filename_lower[..pos]
+                            } else {
+                                &filename_lower
+                            };
+
+                            if word_lower == filename_lower || word_lower == stem {
+                                mentioned_targets.push(filename.clone());
+                            }
+                        }
+                    }
+
+                    // Deduplicate
+                    mentioned_targets.sort();
+                    mentioned_targets.dedup();
+
+                    for target_file in mentioned_targets {
+                        if let Ok(chunks) = rag.get_file_chunks(&target_file) {
+                            if !chunks.is_empty() {
+                                tracing::info!("Explicitly adding all {} chunks of '{}' to context (cleaned)", chunks.len(), target_file);
+                                extra_context.push_str(&format!("\n--- START OF FILE: {} ---\n", target_file));
+                                for (_id, content) in chunks {
+                                    // Extract content after the double newline (where our header ends)
+                                    if let Some(pos) = content.find("\n\n") {
+                                        extra_context.push_str(&content[pos + 2..]);
+                                    } else {
+                                        extra_context.push_str(&content);
+                                    }
+                                }
+                                extra_context.push_str(&format!("\n--- END OF FILE: {} ---\n", target_file));
+                            }
+                        }
+                    }
+
+                    // 2. Regular RAG search
+                    let snippets = rag.search_snippets(&user_input, "user", 20).await.unwrap_or_default();
                     
                     tracing::info!("RAG search returned {} snippets for query: '{}'", snippets.len(), &user_input);
                     for (i, (source, snippet, score)) in snippets.iter().enumerate() {
@@ -960,7 +1108,14 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                     }
                     
                     let mut context_str = String::new();
-                    if !snippets.is_empty() {
+                    if !extra_context.is_empty() {
+                        context_str.push_str("You have been provided with the COMPLETE content of the requested document(s) below. Use this information as your primary source.\n");
+                        context_str.push_str(&extra_context);
+                        context_str.push_str("\nAdditional relevant snippets from other documents:\n");
+                        for (source, snippet, _score) in snippets {
+                            context_str.push_str(&format!("\n[{}]:\n{}\n", source, snippet));
+                        }
+                    } else if !snippets.is_empty() {
                         context_str.push_str("Relevant context from your documents:\n");
                         for (source, snippet, _score) in snippets {
                             context_str.push_str(&format!("\n[{}]:\n{}\n", source, snippet));
@@ -1015,6 +1170,7 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                  if let Some(last) = app.messages.last_mut() {
                      if last.role == "assistant" {
                          last.thinking_collapsed = !last.thinking_collapsed;
+                         last.render_cache.inner = None;
                          let msg = format!(" Thinking Process: {} ", if last.thinking_collapsed { "HIDDEN" } else { "SHOWN" });
                          app.status_message = Some(msg);
                          app.status_message_time = Some(Instant::now());
@@ -1071,15 +1227,48 @@ async fn handle_rag_info_input(app: &mut TuiApp, key: KeyCode, state: &Arc<AppSt
     
     match key {
         KeyCode::Esc => { app.mode = AppMode::Menu; },
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+             let _ = state.rag.clear();
+             app.rag_stats = Some(state.rag.get_stats());
+             app.status_message = Some("Index Cleared!".to_string());
+             app.status_message_time = Some(std::time::Instant::now());
+        },
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.reembed_running = true;
-            app.reembed_progress = "Starting...".to_string();
+            app.reembed_progress = "Initializing...".to_string();
             
             let tx = tx_reembed.clone();
             let rag = state.rag.clone();
             
             tokio::spawn(async move {
-                let result = rag.reembed_all(|current, total, id, metadata| {
+                // 1. Scan for new files first
+                let _ = tx.send(ReembedResult::Progress("Scanning for new files...".to_string())).await;
+                
+                // Helper callback for scanning logs
+                let tx_clone = tx.clone();
+                let log_callback = move |msg: String| {
+                     let _ = tx_clone.try_send(ReembedResult::Progress(msg));
+                };
+                
+                let skip_ids: std::collections::HashSet<String> = match crate::ops::scan_local_data(rag.clone(), log_callback).await {
+                     Ok(ids) => {
+                         if !ids.is_empty() {
+                             let _ = tx.send(ReembedResult::Progress(format!("Indexed {} new chunks.", ids.len()))).await;
+                         } else {
+                             let _ = tx.send(ReembedResult::Progress("No new files found.".to_string())).await;
+                         }
+                         ids.into_iter().collect()
+                     },
+                     Err(e) => {
+                         let _ = tx.send(ReembedResult::Progress(format!("Scan error: {}", e))).await;
+                         std::collections::HashSet::new()
+                     }
+                };
+                
+                // 2. Perform Re-embedding
+                let _ = tx.send(ReembedResult::Progress("Starting re-embedding...".to_string())).await;
+                
+                let result = rag.reembed_all(&skip_ids, |current, total, id, metadata| {
                     let display_name = if let Some(filename) = metadata.get("filename") {
                         filename.clone()
                     } else if let Some(name) = metadata.get("name") {
@@ -1353,7 +1542,7 @@ async fn run_sync_with_logging(
         let _ = tx.send(SyncResult::Log(format!("[{}/{}] Queued: {}", i + 1, total, name))).await;
     }
     
-    let _ = tx.send(SyncResult::Log("⏳ Scraping content (this may take a while)...".to_string())).await;
+    let _ = tx.send(SyncResult::Log(format!("⏳ Scraping content for {} subjects (this may take 2-3 mins)...", total))).await;
     let detailed_subjects = poliformat.scrape_subject_content(subjects).await?;
     let _ = tx.send(SyncResult::Log("✅ Downloads complete!".to_string())).await;
     
@@ -1418,7 +1607,7 @@ async fn run_sync_with_logging(
 
 
 fn draw_settings(frame: &mut Frame, app: &mut TuiApp) {
-    let size = frame.size();
+    let size = frame.area();
     
     let block = Block::default()
         .borders(Borders::ALL)

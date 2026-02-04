@@ -251,6 +251,10 @@ fn scrape_single_subject(
         events_enabled: Some(false),
     });
 
+    // Check if we even need to navigate (files might exist)
+    // But we need to scrape Description/Professors which are HTML on demand.
+    // We can skip heavy downloads like resources zip if folder is populated.
+    
     // Navigate to subject
     if tab.navigate_to(&sub.url).is_err() { 
         let _ = tab.close(true);
@@ -330,7 +334,7 @@ fn scrape_single_subject(
                 if (t.includes('anuncis') || t.includes('avisos') || t.includes('announcements')) result['announcements'] = href;
                 if (t.includes('lliçons') || t.includes('lecciones') || t.includes('lessonbuilder') || t.includes('contenidos')) result['lessons'] = href;
                 if (t.includes('recursos') || t.includes('resources')) result['resources'] = href;
-                if (t.includes('guia') || l.querySelector('.si-es-upv-webasipublic')) result['guiaDocent'] = href;
+                if (t.includes('guia') || t.includes('guía') || l.querySelector('.si-es-upv-webasipublic')) result['guiaDocent'] = href;
             });
             return JSON.stringify(result);
         })()
@@ -359,33 +363,44 @@ fn scrape_single_subject(
             }
 
             if let Some(href) = map.get("resources").and_then(|h| h.as_str()) {
-                let _ = tab.navigate_to(href);
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                let _ = tab.evaluate("document.getElementById('selectall') ? document.getElementById('selectall').click() : null", true);
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = tab.evaluate("document.getElementById('zipdownload-button') ? document.getElementById('zipdownload-button').click() : null", true);
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let _ = tab.evaluate("document.getElementById('zipDownloadButton') ? document.getElementById('zipDownloadButton').click() : null", true);
+                // Check if we already have resources (more than just PDFs we create).
+                // Heuristic: If there are > 5 files, maybe we don't need to download zip.
+                // But user might want update. For now, let's skip if ANY resources exist to be safe/incremental.
+                // Or better: check if "Resources" folder inside exists or just check file count.
+                let resource_files_count = std::fs::read_dir(&final_download_path).map(|d| d.count()).unwrap_or(0);
                 
-                // Wait for downloads to complete
-                wait_for_downloads(&final_download_path, &sub.name);
+                if resource_files_count < 2 { // Only download if almost empty
+                    tracing::info!("Downloading resources for {}...", sub.name);
+                    let _ = tab.navigate_to(href);
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let _ = tab.evaluate("document.getElementById('selectall') ? document.getElementById('selectall').click() : null", true);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let _ = tab.evaluate("document.getElementById('zipdownload-button') ? document.getElementById('zipdownload-button').click() : null", true);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let _ = tab.evaluate("document.getElementById('zipDownloadButton') ? document.getElementById('zipDownloadButton').click() : null", true);
+                    
+                    // Wait for downloads to complete
+                    wait_for_downloads(&final_download_path, &sub.name);
+                } else {
+                     tracing::info!("Skipping resource download for {} (files already exist)", sub.name);
+                }
             }
 
             // Scrape Guia Docent (Teaching Guide / Syllabus PDF)
+            // Strategy 1: Try finding link in menu
+            
             if let Some(href) = map.get("guiaDocent").and_then(|h| h.as_str()) {
-                tracing::info!("Scraping Guia Docent for {}", sub.name);
+                tracing::info!("Found Guia Docent link for {}", sub.name);
                 let _ = tab.navigate_to(href);
                 std::thread::sleep(std::time::Duration::from_secs(4));
                 
-                // Extract page content - the guia docent shows in an iframe or div
+                // Extract page content
                 let guia_content_js = r#"
                     (function() {
-                        // Try iframe first (common in Sakai)
                         let iframe = document.querySelector('iframe');
                         if (iframe && iframe.contentDocument) {
                             return iframe.contentDocument.body.innerText || '';
                         }
-                        // Try main content areas
                         let content = document.querySelector('.portletBody, #content, main');
                         return content ? content.innerText : document.body.innerText;
                     })()
@@ -394,86 +409,182 @@ fn scrape_single_subject(
                     let content = ro_g.value.and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
                     if !content.is_empty() {
                         content_accumulator.push_str(&format!("\n--- GUIA DOCENT ---\n{}\n", content));
-            // We use the "HTML View" + "Print to PDF" strategy by navigating directly to likely URL.
-            tracing::info!("Scraping Guia Docent for {}", sub.name);
+                    }
+                }
+            }
+            
+            // Strategy 2: Direct URL construction (Primary or Fallback)
+            // We ALWAYS run this because it gives us the Description and Professors in a consistent format
+            // which might be missing from the basic "Guia Docent" page in Sakai.
+            tracing::info!("Attempting Direct URL Scraping for Guia/Description/Professors: {}", sub.name);
             
             // Extract numeric ID from subject ID (e.g. GRA_11673_2025_DTU -> 11673)
             let parts: Vec<&str> = sub.id.split('_').collect();
             let subject_id = if parts.len() >= 2 { parts[1] } else { "" };
-            let subject_year = if parts.len() >= 3 { parts[2] } else { "2025" };
+            let subject_year = if parts.len() >= 3 { parts[2] } else { "2025" }; // Default to 2025 if missing
 
             if !subject_id.is_empty() {
-                // https://www.upv.es/pls/soalu/sic_gdoc.get_content?P_ASI={ID}&P_IDIOMA=c&P_VISTA=poliformat&P_TIT=&P_CACA={YEAR}
-                let guia_url = format!("https://www.upv.es/pls/soalu/sic_gdoc.get_content?P_ASI={}&P_IDIOMA=c&P_VISTA=poliformat&P_TIT=&P_CACA={}", subject_id, subject_year);
-                tracing::info!("Navigating to Guia Docent HTML view: {}", guia_url);
+                let base_filename1 = format!("{} (Guia Docent).pdf", sub.name.replace("/", "-"));
+                let base_path1 = final_download_path.join(&base_filename1);
+                
+                if !base_path1.exists() {
+                     // https://www.upv.es/pls/soalu/sic_gdoc.get_content?P_ASI={ID}&P_IDIOMA=c&P_VISTA=poliformat&P_TIT=&P_CACA={YEAR}
+                    let guia_url = format!("https://www.upv.es/pls/soalu/sic_gdoc.get_content?P_ASI={}&P_IDIOMA=c&P_VISTA=poliformat&P_TIT=&P_CACA={}", subject_id, subject_year);
+                    tracing::info!("Navigating to Guia Docent HTML view: {}", guia_url);
 
-                if let Ok(_) = tab.navigate_to(&guia_url) {
-                     let _ = tab.wait_until_navigated();
-                     std::thread::sleep(std::time::Duration::from_secs(3));
-                     
-                     // Print to PDF
-                     // We use the headless_chrome generic print options
-                     tracing::info!("Printing Guia Docent page to PDF...");
-                     match tab.print_to_pdf(None) {
-                         Ok(pdf_data) => {
-                             let pdf_filename = format!("{} (Guia Docent).pdf", sub.name.replace("/", "-"));
-                             let pdf_path = final_download_path.join(&pdf_filename);
-                             if let Err(e) = std::fs::write(&pdf_path, pdf_data) {
-                                 tracing::error!("Failed to write Guia Docent PDF: {}", e);
-                             } else {
-                                 tracing::info!("Saved Guia Docent PDF to {:?}", pdf_path);
-                             }
-                         },
-                         Err(e) => {
-                             tracing::error!("Failed to print PDF: {}", e);
-                         }
-                     }
-                     
-                     // Scrape Description
-                     let desc_url = format!("https://www.upv.es/pls/soalu/sic_gdoc.get_content?P_ASI={}&P_IDIOMA=c&P_VISTA=poliformat&P_TIT=&P_CACA={}&P_CONTENT=descripcion", subject_id, subject_year);
-                     tracing::info!("Scraping Guia Docent Description: {}", desc_url);
-                     if let Ok(_) = tab.navigate_to(&desc_url) {
-                        let _ = tab.wait_until_navigated();
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        if let Ok(ro) = tab.evaluate("document.querySelector('#contenido') ? document.querySelector('#contenido').innerText : document.body.innerText", true) {
-                            let content = ro.value.and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
-                             if !content.is_empty() {
-                                 content_accumulator.push_str(&format!("\n--- GUIA DOCENT DESCRIPTION ---\n{}\n", content));
-                             }
-                        }
-                     }
-
-                     // Scrape Professors
-                     let prof_url = format!("https://www.upv.es/pls/soalu/sic_asi.Profesores?P_OCW=&P_ASI={}&P_CACA={}&P_IDIOMA=c&P_VISTA=poliformat", subject_id, subject_year);
-                     tracing::info!("Scraping Guia Docent Professors: {}", prof_url);
-                      if let Ok(_) = tab.navigate_to(&prof_url) {
-                        let _ = tab.wait_until_navigated();
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        if let Ok(ro) = tab.evaluate("document.querySelector('#contenido') ? document.querySelector('#contenido').innerText : document.body.innerText", true) {
-                            let content = ro.value.and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
-                             if !content.is_empty() {
-                                 content_accumulator.push_str(&format!("\n--- PROFESSORS ---\n{}\n", content));
-                             }
-                        }
-                     }
+                    if let Ok(_) = tab.navigate_to(&guia_url) {
+                            let _ = tab.wait_until_navigated();
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                            
+                            // Check if Guia Docent is valid
+                            let body_text = tab.evaluate("document.body.innerText", true)
+                                .ok()
+                                .and_then(|r| r.value)
+                                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                                .unwrap_or_default();
+                                
+                            if body_text.contains("interno") || body_text.contains("Not Found") || body_text.contains("Error") {
+                                tracing::warn!("Guia Docent not found or error for {}", sub.name);
+                            } else {
+                                // Print to PDF
+                                tracing::info!("Printing Guia Docent page to PDF...");
+                                match tab.print_to_pdf(None) {
+                                    Ok(pdf_data) => {
+                                        if let Err(e) = std::fs::write(&base_path1, pdf_data) {
+                                            tracing::error!("Failed to write Guia Docent PDF: {}", e);
+                                        } else {
+                                            tracing::info!("Saved Guia Docent PDF to {:?}", base_path1);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::error!("Failed to print PDF: {}", e);
+                                    }
+                                }
+                            }
+                    }
                 } else {
-                    tracing::warn!("Failed to navigate to Guia Docent URL");
+                    tracing::info!("Skipping Guia Docent PDF (exists)");
                 }
+                            
+                let base_filename2 = format!("{} (Description).pdf", sub.name.replace("/", "-"));
+                let base_path2 = final_download_path.join(&base_filename2);
+                
+                // Always scrape description text for summary.md even if PDF exists
+                let desc_url = format!("https://www.upv.es/pls/soalu/sic_gdoc.get_content?P_ASI={}&P_IDIOMA=c&P_VISTA=poliformat&P_TIT=&P_CACA={}&P_CONTENT=descripcion", subject_id, subject_year);
+                tracing::info!("Scraping Guia Docent Description: {}", desc_url);
+                if let Ok(_) = tab.navigate_to(&desc_url) {
+                    let _ = tab.wait_until_navigated();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    
+                    if !base_path2.exists() {
+                        // Print Description PDF
+                        tracing::info!("Printing Description to PDF...");
+                        if let Ok(pdf_data) = tab.print_to_pdf(None) {
+                            let _ = std::fs::write(&base_path2, pdf_data);
+                        }
+                    } else {
+                         tracing::info!("Skipping Description PDF (exists)");
+                    }
+                    
+                    if let Ok(ro) = tab.evaluate("document.querySelector('#contenido') ? document.querySelector('#contenido').innerText : document.body.innerText", true) {
+                        let content = ro.value.and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+                            if !content.is_empty() {
+                                content_accumulator.push_str(&format!("\n--- GUIA DOCENT DESCRIPTION ---\n{}\n", content));
+                            }
+                    }
+                }
+
+                let base_filename3 = format!("{} (Professors).pdf", sub.name.replace("/", "-"));
+                let base_path3 = final_download_path.join(&base_filename3);
+                
+                // Always scrape professors text for summary.md
+                let prof_url = format!("https://www.upv.es/pls/soalu/sic_asi.Profesores?P_OCW=&P_ASI={}&P_CACA={}&P_IDIOMA=c&P_VISTA=poliformat", subject_id, subject_year);
+                tracing::info!("Scraping Guia Docent Professors: {}", prof_url);
+                if let Ok(_) = tab.navigate_to(&prof_url) {
+                    let _ = tab.wait_until_navigated();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    
+                    if !base_path3.exists() {
+                        // Print Professors PDF
+                        tracing::info!("Printing Professors to PDF...");
+                        if let Ok(pdf_data) = tab.print_to_pdf(None) {
+                            let _ = std::fs::write(&base_path3, pdf_data);
+                        }
+                    } else {
+                        tracing::info!("Skipping Professors PDF (exists)");
+                    }
+                    
+                    if let Ok(ro) = tab.evaluate("document.querySelector('#contenido') ? document.querySelector('#contenido').innerText : document.body.innerText", true) {
+                        let content = ro.value.and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+                            if !content.is_empty() {
+                                content_accumulator.push_str(&format!("\n--- PROFESSORS ---\n{}\n", content));
+                            }
+                    }
+                }
+        
             } else {
-                 tracing::warn!("Could not extract numeric ID from subject ID: {}", sub.id);
+                    tracing::warn!("Could not extract numeric ID from subject ID: {}", sub.id);
             }
-            
-            // End of Guia Docent logic (No wait_for_downloads needed as we write file directly)
         }
-    }
-    }
-    }
     }
     
     // Write summary.md
     let summary_path = base_path.join("summary.md");
     if let Err(e) = std::fs::write(&summary_path, &content_accumulator) {
         tracing::error!("Failed to write summary.md for {}: {}", sub.name, e);
+    } else {
+        let summary_pdf_path = final_download_path.join("summary.pdf");
+        if !summary_pdf_path.exists() {
+            // Generate Summary PDF
+            tracing::info!("Generating Summary PDF for {}...", sub.name);
+            
+            // Create simple HTML representation
+            let html_content = format!(
+                "<html>
+                <head>
+                    <meta charset='UTF-8'>
+                    <style>
+                        body {{ font-family: sans-serif; margin: 40px; white-space: pre-wrap; }}
+                        h1 {{ color: #000080; border-bottom: 2px solid #000080; padding-bottom: 10px; }}
+                        h2 {{ color: #333; margin-top: 30px; border-bottom: 1px solid #ccc; }}
+                    </style>
+                </head>
+                <body>
+                    <h1>{}</h1>
+                    <p><strong>URL:</strong> <a href='{}'>{}</a></p>
+                    {}
+                </body>
+                </html>",
+                sub.name, sub.url, sub.url,
+                content_accumulator.replace("---", "<h2>").replace("\n", "<br>")
+            );
+            
+            let temp_html_path = base_path.join("temp_summary.html");
+            if let Ok(_) = std::fs::write(&temp_html_path, html_content) {
+                let file_url = format!("file://{}", temp_html_path.canonicalize().unwrap_or(temp_html_path.clone()).to_string_lossy());
+                
+                if let Ok(_) = tab.navigate_to(&file_url) {
+                    let _ = tab.wait_until_navigated();
+                    std::thread::sleep(std::time::Duration::from_millis(1000)); // Allow render
+                    
+                    match tab.print_to_pdf(None) {
+                        Ok(pdf_data) => {
+                            if let Err(e) = std::fs::write(&summary_pdf_path, pdf_data) {
+                                tracing::error!("Failed to write summary.pdf: {}", e);
+                            } else {
+                                tracing::info!("Saved summary.pdf to resources");
+                            }
+                        },
+                        Err(e) => tracing::error!("Failed to print summary PDF: {}", e),
+                    }
+                }
+                
+                // Cleanup temp file
+                let _ = std::fs::remove_file(temp_html_path);
+            }
+        } else {
+             tracing::info!("Skipping Summary PDF (exists)");
+        }
     }
     
     // Close the tab when done

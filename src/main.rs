@@ -123,11 +123,6 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Commands::Sync => {
-             // For sync, we might want more verbose logging to stdout?
-             // But we set stderr filter to error only. 
-             // Ideally we shouldn't change global subscriber.
-             // Ops::run_sync logs via tracing. user will see logs in debug.log.
-             // We can print start/end message.
              println!("Starting Sync (Detailed logs in debug.log)...");
              ops::run_sync(rag, poliformat).await?;
         },
@@ -135,6 +130,15 @@ async fn main() -> anyhow::Result<()> {
              tui::run_app(state).await?;
         },
         Commands::ExtractPdf { .. } => unreachable!(), // Handled above
+    }
+
+    // Drop guard to flush and close the log file
+    drop(_guard);
+    
+    // Clean up debug log on clean exit
+    let log_file = config::Config::get_app_data_dir().join("debug.log");
+    if log_file.exists() {
+        let _ = std::fs::remove_file(log_file);
     }
 
     Ok(())

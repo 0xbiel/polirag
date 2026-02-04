@@ -11,7 +11,15 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::AddBos;
 
 // Embed the model directly into the binary
-const MODEL_BYTES: &[u8] = include_bytes!("../../embeddinggemma-300m-Q4_0.gguf");
+// Macro to embed model and keep track of path
+macro_rules! embed_model {
+    ($path:literal) => {
+        const MODEL_BYTES: &[u8] = include_bytes!($path);
+        const MODEL_PATH: &str = $path;
+    }
+}
+
+embed_model!("../../embeddinggemma-300m-Q4_0.gguf");
 
 struct LlamaState {
     // We keep the backend alive
@@ -195,22 +203,23 @@ impl EmbeddingModel {
     }
 
     fn chunk_text(&self, text: &str) -> Vec<String> {
-        let mut chunks = Vec::new();
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let mut current_chunk = String::new();
-        for word in words {
-            if current_chunk.len() + word.len() + 1 > MAX_CHUNK_CHARS {
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk.trim().to_string());
-                    current_chunk = String::new();
-                }
-            }
-            if !current_chunk.is_empty() { current_chunk.push(' '); }
-            current_chunk.push_str(word);
-        }
-        if !current_chunk.is_empty() { chunks.push(current_chunk.trim().to_string()); }
-        chunks
+        let splitter = text_splitter::TextSplitter::new(MAX_CHUNK_CHARS);
+        
+        splitter.chunks(text)
+            .map(|s: &str| s.to_string())
+            .collect()
     }
-    
 
+    pub fn model_name(&self) -> String {
+        std::path::Path::new(MODEL_PATH)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown_model")
+            .to_string()
+    }
+
+    pub fn chunking_strategy(&self) -> String {
+        format!("Semantic (TextSplitter) - {} chars", MAX_CHUNK_CHARS)
+    }
 }
+
