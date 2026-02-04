@@ -8,13 +8,23 @@
 \usepackage{graphicx}
 \usepackage{float}
 \usepackage{longtable}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{tgheros}
+\usepackage{fancyhdr}
 
 \geometry{margin=1in}
+
+% Sans-serif for sections
+\titleformat{\section}{\large\sffamily\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\sffamily\bfseries}{\thesubsection}{1em}{}
 
 \definecolor{codegreen}{rgb}{0,0.6,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
 \definecolor{codepurple}{rgb}{0.58,0,0.82}
-\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+\definecolor{backcolour}{rgb}{0.97,0.97,0.98}
+\definecolor{primaryblue}{rgb}{0.12, 0.29, 0.49}
 
 \lstdefinestyle{mystyle}{
     backgroundcolor=\color{backcolour},   
@@ -32,17 +42,32 @@
     showspaces=false,                
     showstringspaces=false,
     showtabs=false,                  
-    tabsize=2
+    tabsize=2,
+    frame=single,
+    rulecolor=\color{codegray!30}
 }
 \lstset{style=mystyle}
 
-\title{\textbf{PoliRag}}
-\author{0xbiel}
-\date{\today}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=primaryblue,
+    filecolor=magenta,      
+    urlcolor=primaryblue,
+}
 
 \begin{document}
 
-\maketitle
+\begin{titlepage}
+    \centering
+    \vspace*{1cm}
+    {\huge\bfseries\sffamily PoliRag\par}
+    \vspace{0.5cm}
+    {\large PoliformaT Retrieval-Augmented Generation\par}
+    \vspace{2cm}
+    {\Large\itshape 0xbiel\par}
+    \vfill
+    {\large \today\par}
+\end{titlepage}
 \newpage
 \tableofcontents
 \newpage
@@ -95,18 +120,20 @@ While navigating subjects is sequential (to manage the browser's download behavi
 \begin{itemize}
     \item \textbf{Subject Discovery}: Executes a JS snippet in the browser context to parse the DOM and extract all subject URLs, deduplicating them.
     \item \textbf{Download Management}: The scraper uses \texttt{Page.setDownloadBehavior} to redirect downloads to a per-subject directory. It monitors file system events (presence of \texttt{.crdownload} files) to ensure completion.
+    \item \textbf{Enhanced Content Extraction}: Beyond PDF files, the scraper now automatically navigates to the "Guia Docent" and "Syllabus" pages to extract rich text descriptions and professor information, providing a more comprehensive context for the RAG system.
 \end{itemize}
 
 \subsection{RAG Engine (\texttt{src/rag})}
 The core of PoliRag is its vector search capabilities.
 
 \subsubsection{Embedding Model}
-PoliRag embeds a quantized 300M parameter model directly into the binary using the \texttt{embed\_model!} macro.
+PoliRag utilizes a dynamic embedding system powered by a custom \texttt{embed\_model!} macro.
 \begin{itemize}
-    \item \textbf{Model}: \texttt{google/embedding-gemma-300m-Q4\_0.gguf}.
+    \item \textbf{Dynamic Loading}: The macro allows for switching between different models (e.g., \texttt{google/embedding-gemma-300m} or \texttt{nomic-embed-text}) based on configuration, without recompiling the entire logic.
+    \item \textbf{Model}: Defaults to quantized GGUF models (e.g., \texttt{Q4\_0} precision).
     \item \textbf{Engine}: \texttt{llama.cpp} bindings.
-    \item \textbf{Hardware Acceleration}: On macOS, the system offloads all 999 layers to Metal (GPU), ensuring extremely fast inference.
-    \item \textbf{Chunking Strategy}: Uses \texttt{text-splitter} with a max chunk size of 512 tokens (approx. 1024 characters). It creates overlapping semantic chunks to preserve context at boundaries.
+    \item \textbf{Hardware Acceleration}: On macOS, the system offloads all layers to Metal (GPU) for near-instant inference.
+    \item \textbf{Chunking Strategy}: Uses overlapping semantic chunks (max 512 tokens) to preserve contextual coherence across document fragments.
 \end{itemize}
 
 \subsubsection{Vector Storage (HNSW)}
@@ -133,9 +160,10 @@ The main thread runs the UI render loop. Heavy operations (LLM generation, Sync)
 
 \subsubsection{Rendering Pipeline}
 \begin{itemize}
-    \item \textbf{Markdown Caching}: Because re-parsing markdown every frame is expensive, the \texttt{ChatMessage} struct caches the rendered cell layout.
-    \item \textbf{Throbber}: An animated state indicator provides visual feedback for background processes without blocking input.
-    \item \textbf{Thinking Blocks}: Special handling for \texttt{<think>} tags from reasoning models allows the UI to collapse/expand chain-of-thought traces.
+    \item \textbf{Markdown Caching}: Re-parsing markdown every frame is CPU-intensive. PoliRag implements a cell-level cache for rendered lines, enabling fluid 60FPS scrolling and near real-time text streaming even with complex formatting.
+    \item \textbf{Throbber \& Progress Status}: Animated indicators provide feedback for background processes like scraping or "thinking" states.
+    \item \textbf{Thinking Blocks}: Native support for DeepSeek-style reasoning models. The UI detects \texttt{<think>} tags and allows users to toggle the visibility of the chain-of-thought, keeping the interface clean.
+    \item \textbf{Intelligent Filename Detection}: The chat interface matches keywords against the local document index. If a user asks for a specific file (e.g., "summarize 'p1.pdf'"), the system retrieves the full content rather than just snippets.
 \end{itemize}
 
 \section{Data Structures}
@@ -169,12 +197,6 @@ pub struct Config {
     \item \textbf{Credential Security}: Credentials are not stored in plain text. A simple XOR encryption with a hardcoded key obfuscates them on disk, preventing casual snooping (though not robust against determined attackers with binary access).
     \item \textbf{Graceful Degradation}: If the HNSW index is corrupted or missing, the system attempts to rebuild it or start fresh rather than crashing.
     \item \textbf{Network Resilience}: The scraper includes retry logic for finding DOM elements, handling the slow loading times of the university portal.
-\end{itemize}
-
-\section{Future Improvements}
-\begin{itemize}
-    \item \textbf{Hybrid Search}: Combine dense vector retrieval with BM25 keyword search for better exact-match performance (e.g., searching for specific acronyms).
-    \item \textbf{File Watcher}: Automatically re-index files when they are modified in the local \texttt{data/} directory.
 \end{itemize}
 
 \end{document}
