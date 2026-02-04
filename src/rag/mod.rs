@@ -3,7 +3,7 @@ pub mod store;
 pub mod hnsw_store;
 
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use crate::rag::store::VectorStore;
 use std::path::Path;
@@ -122,10 +122,58 @@ impl RagSystem {
         let mut store = self.store.lock().unwrap();
         store.clear()
     }
+
+    /// Check if a document exists in the index
+    pub fn contains(&self, id: &str) -> bool {
+        self.store.lock().unwrap().contains(id)
+    }
+
+    /// Save the index to disk
+    pub fn save(&self) -> anyhow::Result<()> {
+        let store = self.store.lock().unwrap();
+        store.save()
+    }
+    
+    /// Remove a document from the index
+    pub fn remove_document(&self, id: &str) -> anyhow::Result<()> {
+        let mut store = self.store.lock().unwrap();
+        store.remove_document(id)
+    }
+
+    /// Get all chunks for a specific file, sorted by index
+    pub fn get_file_chunks(&self, filename: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let store = self.store.lock().unwrap();
+        let mut chunks = store.get_documents_by_metadata("filename", filename)?;
+        
+        // Sort by ID to ensure correct part order (assuming part index is in ID)
+        // IDs are formatted as "subject/path#index"
+        chunks.sort_by(|a, b| {
+            let get_idx = |id: &str| -> usize {
+                id.split('#').last().and_then(|s| s.parse().ok()).unwrap_or(0)
+            };
+            get_idx(&a.id).cmp(&get_idx(&b.id))
+        });
+        
+        Ok(chunks.into_iter().map(|d| (d.id, d.content)).collect())
+    }
+
+    /// Get a list of all unique filenames in the index
+    pub fn get_all_filenames(&self) -> anyhow::Result<HashSet<String>> {
+        let store = self.store.lock().unwrap();
+        let docs = store.get_all()?;
+        let mut filenames = HashSet::new();
+        for doc in docs {
+            if let Some(filename) = doc.metadata.get("filename") {
+                filenames.insert(filename.clone());
+            }
+        }
+        Ok(filenames)
+    }
     
     /// Recalculate embeddings for all documents
     /// progress_fn receives (current, total, doc_id, metadata)
-    pub async fn reembed_all<F>(&self, mut progress_fn: F) -> anyhow::Result<usize>
+    /// skip_ids allows avoiding redundant work for documents already indexed in this run
+    pub async fn reembed_all<F>(&self, skip_ids: &HashSet<String>, mut progress_fn: F) -> anyhow::Result<usize>
     where
         F: FnMut(usize, usize, &str, &HashMap<String, String>),
     {
@@ -139,6 +187,12 @@ impl RagSystem {
         let mut reembedded = 0;
         
         for (i, old_doc) in docs.into_iter().enumerate() {
+            if skip_ids.contains(&old_doc.id) {
+                reembedded += 1;
+                progress_fn(i + 1, total, &old_doc.id, &old_doc.metadata);
+                continue;
+            }
+            
             progress_fn(i + 1, total, &old_doc.id, &old_doc.metadata);
             
             // Recalculate embedding

@@ -175,19 +175,58 @@ impl VectorStore for HnswVectorStore {
         self.save()
     }
 
+    fn contains(&self, id: &str) -> bool {
+        self.id_map.read().unwrap().contains_key(id)
+    }
+
+    fn remove_document(&mut self, id: &str) -> Result<()> {
+        let mut documents = self.documents.write().unwrap();
+        let mut id_map = self.id_map.write().unwrap();
+        
+        if let Some(internal_id) = id_map.remove(id) {
+            documents.remove(&internal_id);
+            // Internal ID is now effectively "orphaned" in the HNSW graph.
+            // On save, we only iterate over `documents`, so it will be cleaned up.
+        }
+        
+        Ok(())
+    }
+
+    fn get_documents_by_metadata(&self, key: &str, value: &str) -> Result<Vec<Document>> {
+        let documents = self.documents.read().unwrap();
+        let docs = documents.values()
+            .filter(|d| d.metadata.get(key).map_or(false, |v| v == value))
+            .cloned()
+            .collect();
+        Ok(docs)
+    }
+
     fn save(&self) -> Result<()> {
         let hnsw = self.hnsw.read().unwrap();
         let documents = self.documents.read().unwrap();
         let next_id = *self.next_id.read().unwrap();
 
         let data_path = self.storage_path.with_extension("data");
-
-        // Save HNSW
-        // Hnsw::file_dump expects directory and basename
+        
         let directory = self.storage_path.parent().unwrap_or(Path::new("."));
         let basename = self.storage_path.file_stem().unwrap().to_str().unwrap();
-        
-        hnsw.file_dump(directory, basename).context("Failed to save HNSW index")?;
+
+        // Handle empty index case: hnsw_rs fails on empty dump, so we remove files instead
+        if documents.is_empty() {
+             tracing::info!("Index is empty, removing persistence files.");
+             let _ = std::fs::remove_file(&data_path);
+             let _ = std::fs::remove_file(directory.join(format!("{}.hnsw.graph", basename)));
+             let _ = std::fs::remove_file(directory.join(format!("{}.hnsw.data", basename)));
+             return Ok(());
+        }
+
+        tracing::info!("Dumping HNSW to dir: {:?}, basename: {}", directory, basename);
+        if !directory.exists() {
+             tracing::info!("Directory {:?} does not exist, creating...", directory);
+             std::fs::create_dir_all(directory)?;
+        }
+
+        hnsw.file_dump(directory, basename).context(format!("Failed to save HNSW index to {:?}/{}", directory, basename))?;
 
         // Save Data
         let data = StoredData {

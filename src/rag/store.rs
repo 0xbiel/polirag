@@ -33,7 +33,17 @@ pub trait VectorStore: Send + Sync {
     fn get_stats(&self) -> StoreStats;
     
     /// Get store type description (e.g. "Linear Scan", "HNSW")
+    /// Get store type description (e.g. "Linear Scan", "HNSW")
     fn store_type(&self) -> String;
+    
+    /// Check if a document with the given ID exists
+    fn contains(&self, id: &str) -> bool;
+    
+    /// Remove a document by ID
+    fn remove_document(&mut self, id: &str) -> Result<()>;
+
+    /// Get documents by metadata key-value pair
+    fn get_documents_by_metadata(&self, key: &str, value: &str) -> Result<Vec<Document>>;
 }
 
 #[derive(Default)]
@@ -120,6 +130,23 @@ impl VectorStore for LinearVectorStore {
     fn clear(&mut self) -> Result<()> {
         self.index.documents.clear();
         self.save()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.index.documents.iter().any(|d| d.id == id)
+    }
+
+    fn remove_document(&mut self, id: &str) -> Result<()> {
+        self.index.documents.retain(|d| d.id != id);
+        self.save()
+    }
+
+    fn get_documents_by_metadata(&self, key: &str, value: &str) -> Result<Vec<Document>> {
+        let docs = self.index.documents.iter()
+            .filter(|d| d.metadata.get(key).map_or(false, |v| v == value))
+            .cloned()
+            .collect();
+        Ok(docs)
     }
 
     fn save(&self) -> Result<()> {

@@ -1,6 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use tui_markdown::from_str;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 
@@ -43,7 +42,7 @@ pub fn render_markdown(text: &str, max_width: usize, thinking_collapsed: bool) -
             // but usually raw is fine and safer for stream.
             let wrapped = wrap_text_simple(think, max_width);
             for w in wrapped {
-                lines.push(Line::from(Span::styled(w, think_style)));
+                lines.push(Line::from(Span::styled(format!("   {}", w), think_style)));
             }
             lines.push(Line::from(""));
         }
@@ -57,125 +56,174 @@ pub fn render_markdown(text: &str, max_width: usize, thinking_collapsed: bool) -
     let gfm_processed = preprocess_gfm_tables(main_content_raw, max_width);
     let processed_content = preprocess_ascii_tables(&gfm_processed);
 
-    // 4. Render Main Content using tui-markdown
-    // tui-markdown returns a Text<'a>, we convert to Vec<Line>
-    // tui-markdown returns a Text<'a>, we convert to Vec<Line>
-    let rendered_text = from_str(&processed_content);
-    
-    // Convert rendered_text to our Vec<Line> (and apply max_width via wrapping if needed?)
-    // tui-markdown doesn't do wrapping by default, correct? 
-    // Wait, the documentation says "The Text widget can then be rendered...".
-    // Text widget in Ratatui wraps automatically if we render it in a paragraph with wrap.
-    // But here we are returning Vec<Line> to be put in a List or similar.
-    // If we put it in a List, it won't wrap automatically.
-    // Actually, tui-markdown output is likely unwrapped lines.
-    // For now, let's just push them. If wrapping is needed, Ratatui's Paragraph/List might need help.
-    // IMPORTANT: The user's TUI likely uses a List of lines. We might need to manual wrap paragraphs?
-    // Let's assume tui-markdown handles basic wrapping *or* we rely on the TUI widget to wrap.
-    // Checking the user's previous code, `render_markdown` returned `Vec<Line>`.
-    // And `wrap_text` was manually called.
-    // tui-markdown does NOT wrap. 
-    // However, implementing manual wrapping on `tui-markdown` output is hard because we lose semantic info.
-    // BUT! `tui-markdown` just produces styled lines.
-    // Let's trust that for now, but if wrapping is broken for normal text, we might need to 
-    // wrap the *input* markdown or post-process.
-    // Actually, `tui-markdown` might not wrap.
-    // Let's rely on standard behavior first.
-    
-    // Convert rendered_text to owned lines to escape the lifetime of processed_content
-    // 5. Post-process lines to remove "polirag_table" fences
-    // tui-markdown renders fences for code blocks. We want to hide them for our auto-generated tables.
-    let lines_vec: Vec<Line> = rendered_text.lines.into_iter().map(|l| convert_core_line(l)).collect();
-    
-    // Filter out the fences
-    // We look for lines that consist exactly of "```polirag_table" or "```" (closing).
-    let mut cleaned_lines = Vec::new();
-    let mut in_polirag_table = false;
-    
-    for line in lines_vec {
-        let text_content = line.to_string(); // Helper or spans join
-        if text_content.trim() == "```polirag_table" {
-            in_polirag_table = true;
-            continue; // Skip fence
+    // 4. Custom Markdown Rendering
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(&processed_content, options);
+
+    let mut current_line = Vec::new();
+    let mut style_stack = vec![Style::default()];
+    let mut list_index = vec![];
+    let mut list_depth = 0;
+    let mut in_code_block = false;
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => {
+                match tag {
+                    Tag::Paragraph => {
+                        if !lines.is_empty() || !current_line.is_empty() { lines.push(Line::from("")); }
+                    }
+                    Tag::Heading { level, .. } => {
+                        if !lines.is_empty() || !current_line.is_empty() { lines.push(Line::from("")); }
+                        let color = match level {
+                            pulldown_cmark::HeadingLevel::H1 => Color::Cyan,
+                            pulldown_cmark::HeadingLevel::H2 => Color::Blue,
+                            pulldown_cmark::HeadingLevel::H3 => Color::Magenta,
+                            _ => Color::White,
+                        };
+                        style_stack.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
+                    }
+                    Tag::List(start) => {
+                        list_depth += 1;
+                        list_index.push(start);
+                    }
+                    Tag::Item => {
+                        let indent = "  ".repeat(list_depth - 1);
+                        let bullet = match list_depth {
+                            1 => "• ",
+                            2 => "◦ ",
+                            _ => "▪ ",
+                        };
+                        current_line.push(Span::raw(format!("{}{}", indent, bullet)));
+                    }
+                    Tag::Emphasis => {
+                        let current = *style_stack.last().unwrap();
+                        style_stack.push(current.add_modifier(Modifier::ITALIC));
+                    }
+                    Tag::Strong => {
+                        let current = *style_stack.last().unwrap();
+                        style_stack.push(current.add_modifier(Modifier::BOLD));
+                    }
+                    Tag::Strikethrough => {
+                        let current = *style_stack.last().unwrap();
+                        style_stack.push(current.add_modifier(Modifier::CROSSED_OUT));
+                    }
+                    Tag::CodeBlock(_) => {
+                        in_code_block = true;
+                        lines.push(Line::from(""));
+                    }
+                    Tag::BlockQuote(_) => {
+                        style_stack.push(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+                        current_line.push(Span::styled("▎ ", Style::default().fg(Color::Blue)));
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(tag) => {
+                match tag {
+                    TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => {
+                        let is_heading = matches!(tag, TagEnd::Heading(_));
+                        if is_heading { style_stack.pop(); }
+                        let line = Line::from(current_line.drain(..).collect::<Vec<_>>());
+                        // Simple wrapping for lines
+                        for wrapped in wrap_line(line, max_width) {
+                            lines.push(wrapped);
+                        }
+                    }
+                    TagEnd::List(_) => {
+                        list_depth -= 1;
+                        list_index.pop();
+                    }
+                    TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::BlockQuote(_) => {
+                        style_stack.pop();
+                    }
+                    TagEnd::CodeBlock => {
+                        in_code_block = false;
+                        lines.push(Line::from(""));
+                    }
+                    _ => {}
+                }
+            }
+            Event::Text(t) => {
+                if in_code_block {
+                    for line in t.lines() {
+                        lines.push(Line::from(Span::styled(format!("  {}", line), Style::default().fg(Color::DarkGray))));
+                    }
+                } else {
+                    current_line.push(Span::styled(t.into_string(), *style_stack.last().unwrap()));
+                }
+            }
+            Event::Code(c) => {
+                current_line.push(Span::styled(c.into_string(), Style::default().fg(Color::Yellow)));
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                current_line.push(Span::raw(" "));
+            }
+            _ => {}
         }
-        if in_polirag_table && text_content.trim() == "```" {
-            in_polirag_table = false;
-            continue; // Skip fence
-        }
-        cleaned_lines.push(line);
     }
-    lines.extend(cleaned_lines);
+
+    // Clean up empty lines at start/end
+    while lines.first().map_or(false, |l| l.to_string().trim().is_empty()) { lines.remove(0); }
+    while lines.last().map_or(false, |l| l.to_string().trim().is_empty()) { lines.pop(); }
 
     lines
 }
 
-fn convert_core_line(line: ratatui_core::text::Line<'_>) -> Line<'static> {
-    let spans: Vec<Span<'static>> = line.spans.into_iter().map(|s| {
-        // Convert core Span to standard Span
-        // We need to convert Style too if they are different types (they likely are distinct)
-        // Fortunately Style usually implements Into or has same fields.
-        let core_style = s.style;
-        let style = convert_core_style(core_style);
-        
-        Span::styled(s.content.into_owned(), style)
-    }).collect();
-    // Alignment might be lost if we don't map it, but Line::from(spans) defaults to Left.
-    // ratatui_core::Line has alignment field.
-    let new_line = Line::from(spans);
-    // basic mapping for alignment if needed, but usually markdown is left aligned.
-    new_line
-}
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    let mut current_spans = Vec::new();
+    let mut current_width = 0;
 
-fn convert_core_style(style: ratatui_core::style::Style) -> Style {
-    let mut s = Style::default();
-    
-    if let Some(fg) = style.fg { s = s.fg(convert_core_color(fg)); }
-    if let Some(bg) = style.bg { s = s.bg(convert_core_color(bg)); }
-    
-    s = s.add_modifier(convert_core_modifier(style.add_modifier));
-    s = s.remove_modifier(convert_core_modifier(style.sub_modifier));
-    s
-}
+    for span in line.spans {
+        let content = span.content.as_ref();
+        let style = span.style;
+        let words: Vec<&str> = content.split_inclusive(' ').collect();
 
-fn convert_core_color(c: ratatui_core::style::Color) -> Color {
-    // Enum mapping
-    match c {
-        ratatui_core::style::Color::Reset => Color::Reset,
-        ratatui_core::style::Color::Black => Color::Black,
-        ratatui_core::style::Color::Red => Color::Red,
-        ratatui_core::style::Color::Green => Color::Green,
-        ratatui_core::style::Color::Yellow => Color::Yellow,
-        ratatui_core::style::Color::Blue => Color::Blue,
-        ratatui_core::style::Color::Magenta => Color::Magenta,
-        ratatui_core::style::Color::Cyan => Color::Cyan,
-        ratatui_core::style::Color::Gray => Color::Gray,
-        ratatui_core::style::Color::DarkGray => Color::DarkGray,
-        ratatui_core::style::Color::LightRed => Color::LightRed,
-        ratatui_core::style::Color::LightGreen => Color::LightGreen,
-        ratatui_core::style::Color::LightYellow => Color::LightYellow,
-        ratatui_core::style::Color::LightBlue => Color::LightBlue,
-        ratatui_core::style::Color::LightMagenta => Color::LightMagenta,
-        ratatui_core::style::Color::LightCyan => Color::LightCyan,
-        ratatui_core::style::Color::White => Color::White,
-        ratatui_core::style::Color::Indexed(i) => Color::Indexed(i),
-        ratatui_core::style::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        for word in words {
+            let word_len = word.chars().count();
+            if current_width + word_len > width && !current_spans.is_empty() {
+                result.push(Line::from(current_spans));
+                current_spans = Vec::new();
+                current_width = 0;
+            }
+            current_spans.push(Span::styled(word.to_string(), style));
+            current_width += word_len;
+        }
     }
+    if !current_spans.is_empty() {
+        result.push(Line::from(current_spans));
+    }
+    result
 }
 
-fn convert_core_modifier(m: ratatui_core::style::Modifier) -> Modifier {
-    let mut modifier = Modifier::empty();
-    if m.contains(ratatui_core::style::Modifier::BOLD) { modifier |= Modifier::BOLD; }
-    if m.contains(ratatui_core::style::Modifier::DIM) { modifier |= Modifier::DIM; }
-    if m.contains(ratatui_core::style::Modifier::ITALIC) { modifier |= Modifier::ITALIC; }
-    if m.contains(ratatui_core::style::Modifier::UNDERLINED) { modifier |= Modifier::UNDERLINED; }
-    if m.contains(ratatui_core::style::Modifier::SLOW_BLINK) { modifier |= Modifier::SLOW_BLINK; }
-    if m.contains(ratatui_core::style::Modifier::RAPID_BLINK) { modifier |= Modifier::RAPID_BLINK; }
-    if m.contains(ratatui_core::style::Modifier::REVERSED) { modifier |= Modifier::REVERSED; }
-    if m.contains(ratatui_core::style::Modifier::HIDDEN) { modifier |= Modifier::HIDDEN; }
-    if m.contains(ratatui_core::style::Modifier::CROSSED_OUT) { modifier |= Modifier::CROSSED_OUT; }
-    modifier
+// Simple wrapper for the Thinking block (gray text)
+fn wrap_text_simple(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.chars().count() > width {
+             // Basic hard wrap
+             let mut current = String::new();
+             let mut count = 0;
+             for c in line.chars() {
+                 if count >= width {
+                     lines.push(current);
+                     current = String::new();
+                     count = 0;
+                 }
+                 current.push(c);
+                 count += 1;
+             }
+             if !current.is_empty() {
+                 lines.push(current);
+             }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines
 }
-
 /// Wraps ASCII tables/box-drawings in ```text code blocks to prevent markdown parsing from butchering them
 fn preprocess_ascii_tables(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
@@ -213,7 +261,7 @@ fn preprocess_ascii_tables(text: &str) -> String {
 
         if is_ascii_line {
              if !in_ascii_block {
-                 result.push_str("\n```polirag_table\n"); // Start code block with hidden tag
+                 result.push_str("\n```text\n"); // Start code block with hidden tag
                  in_ascii_block = true;
              }
              result.push_str(line);
@@ -236,32 +284,6 @@ fn preprocess_ascii_tables(text: &str) -> String {
     result
 }
 
-// Simple wrapper for the Thinking block (gray text)
-fn wrap_text_simple(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for line in text.lines() {
-        if line.chars().count() > width {
-             // Basic hard wrap
-             let mut current = String::new();
-             let mut count = 0;
-             for c in line.chars() {
-                 if count >= width {
-                     lines.push(current);
-                     current = String::new();
-                     count = 0;
-                 }
-                 current.push(c);
-                 count += 1;
-             }
-             if !current.is_empty() {
-                 lines.push(current);
-             }
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-    lines
-}
 fn preprocess_gfm_tables(text: &str, max_width: usize) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -416,7 +438,6 @@ fn render_table_from_events(events: &[Event], max_width: usize) -> String {
 
     // Render
     let mut out = String::new();
-    out.push_str("\n```polirag_table\n");
     
     // Top Border
     out.push('┌');
@@ -481,6 +502,6 @@ fn render_table_from_events(events: &[Event], max_width: usize) -> String {
     }
     out.push('┘');
     
-    out.push_str("\n```\n");
+    out.push('\n');
     out
 }

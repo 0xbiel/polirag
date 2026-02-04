@@ -2,7 +2,7 @@
 
 _By 0xbiel_
 
-![PoliRag TUI](https://raw.githubusercontent.com/0xbiel/polirag/main/assets/demo.png)
+![PoliRag TUI](assets/demo.png)
 
 ## Overview
 
@@ -62,7 +62,7 @@ Select **Sync Data** from the main menu. PoliRag will:
 ### 💬 Chat
 Select **Chat with Assistant**.
 - **Ask questions** about your subjects (e.g., "What is the evaluation method for IAP?").
-- **Collapsible Thinking**: Toggle the "Thinking" block visibility with `Ctrl+T` (if using a reasoning model).
+- **Collapsible Thinking**: Toggle the "Thinking" block visibility with `Ctrl+T` (if using a compatible reasoning model like Qwen 3).
 - **History**: Scroll up/down to view past context.
 
 ### ⚙️ Configuration

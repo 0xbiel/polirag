@@ -543,16 +543,26 @@ fn draw_rag_info(frame: &mut Frame, app: &mut TuiApp) {
             .alignment(Alignment::Center);
         frame.render_widget(progress, button_area);
     } else {
-        let button = Paragraph::new("  ▶ [R] Recalculate Embeddings  ")
+        let buttons_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(button_area);
+
+        let reembed_button = Paragraph::new("  ▶ [R] Recalculate  ")
             .style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
             .alignment(Alignment::Center);
-        frame.render_widget(button, button_area);
+        frame.render_widget(reembed_button, buttons_layout[0]);
+
+        let clear_button = Paragraph::new("  🗑 [C] Clear Index  ")
+            .style(Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center);
+        frame.render_widget(clear_button, buttons_layout[1]);
     }
     
     let instr_text = if app.reembed_running { 
         "Recalculating embeddings..." 
     } else { 
-        "R Recalculate │ Esc Menu" 
+        "Esc Menu" 
     };
     let instr = Paragraph::new(instr_text).style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center);
     frame.render_widget(instr, layout[4]);
@@ -1039,8 +1049,58 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                 let messages = app.messages.clone();
                 
                 tokio::spawn(async move {
-                    // Fetch more results for better coverage
-                    let snippets = rag.search_snippets(&user_input, "user", 10).await.unwrap_or_default();
+                    // 1. Detect explicit file mentions (e.g. .pdf or filename stems)
+                    let mut extra_context = String::new();
+                    let words: Vec<&str> = user_input.split_whitespace().collect();
+                    
+                    let all_filenames = rag.get_all_filenames().unwrap_or_default();
+                    let mut mentioned_targets = Vec::new();
+
+                    for word in words {
+                        let word_clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-');
+                        if word_clean.len() < 4 { continue; } // Skip short common words
+                        
+                        let word_lower = word_clean.to_lowercase();
+                        
+                        // Check for direct match or stem match
+                        for filename in &all_filenames {
+                            let filename_lower = filename.to_lowercase();
+                            let stem = if let Some(pos) = filename_lower.find(".pdf") {
+                                &filename_lower[..pos]
+                            } else {
+                                &filename_lower
+                            };
+
+                            if word_lower == filename_lower || word_lower == stem {
+                                mentioned_targets.push(filename.clone());
+                            }
+                        }
+                    }
+
+                    // Deduplicate
+                    mentioned_targets.sort();
+                    mentioned_targets.dedup();
+
+                    for target_file in mentioned_targets {
+                        if let Ok(chunks) = rag.get_file_chunks(&target_file) {
+                            if !chunks.is_empty() {
+                                tracing::info!("Explicitly adding all {} chunks of '{}' to context (cleaned)", chunks.len(), target_file);
+                                extra_context.push_str(&format!("\n--- START OF FILE: {} ---\n", target_file));
+                                for (_id, content) in chunks {
+                                    // Extract content after the double newline (where our header ends)
+                                    if let Some(pos) = content.find("\n\n") {
+                                        extra_context.push_str(&content[pos + 2..]);
+                                    } else {
+                                        extra_context.push_str(&content);
+                                    }
+                                }
+                                extra_context.push_str(&format!("\n--- END OF FILE: {} ---\n", target_file));
+                            }
+                        }
+                    }
+
+                    // 2. Regular RAG search
+                    let snippets = rag.search_snippets(&user_input, "user", 20).await.unwrap_or_default();
                     
                     tracing::info!("RAG search returned {} snippets for query: '{}'", snippets.len(), &user_input);
                     for (i, (source, snippet, score)) in snippets.iter().enumerate() {
@@ -1048,7 +1108,14 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                     }
                     
                     let mut context_str = String::new();
-                    if !snippets.is_empty() {
+                    if !extra_context.is_empty() {
+                        context_str.push_str("You have been provided with the COMPLETE content of the requested document(s) below. Use this information as your primary source.\n");
+                        context_str.push_str(&extra_context);
+                        context_str.push_str("\nAdditional relevant snippets from other documents:\n");
+                        for (source, snippet, _score) in snippets {
+                            context_str.push_str(&format!("\n[{}]:\n{}\n", source, snippet));
+                        }
+                    } else if !snippets.is_empty() {
                         context_str.push_str("Relevant context from your documents:\n");
                         for (source, snippet, _score) in snippets {
                             context_str.push_str(&format!("\n[{}]:\n{}\n", source, snippet));
@@ -1160,15 +1227,48 @@ async fn handle_rag_info_input(app: &mut TuiApp, key: KeyCode, state: &Arc<AppSt
     
     match key {
         KeyCode::Esc => { app.mode = AppMode::Menu; },
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+             let _ = state.rag.clear();
+             app.rag_stats = Some(state.rag.get_stats());
+             app.status_message = Some("Index Cleared!".to_string());
+             app.status_message_time = Some(std::time::Instant::now());
+        },
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.reembed_running = true;
-            app.reembed_progress = "Starting...".to_string();
+            app.reembed_progress = "Initializing...".to_string();
             
             let tx = tx_reembed.clone();
             let rag = state.rag.clone();
             
             tokio::spawn(async move {
-                let result = rag.reembed_all(|current, total, id, metadata| {
+                // 1. Scan for new files first
+                let _ = tx.send(ReembedResult::Progress("Scanning for new files...".to_string())).await;
+                
+                // Helper callback for scanning logs
+                let tx_clone = tx.clone();
+                let log_callback = move |msg: String| {
+                     let _ = tx_clone.try_send(ReembedResult::Progress(msg));
+                };
+                
+                let skip_ids: std::collections::HashSet<String> = match crate::ops::scan_local_data(rag.clone(), log_callback).await {
+                     Ok(ids) => {
+                         if !ids.is_empty() {
+                             let _ = tx.send(ReembedResult::Progress(format!("Indexed {} new chunks.", ids.len()))).await;
+                         } else {
+                             let _ = tx.send(ReembedResult::Progress("No new files found.".to_string())).await;
+                         }
+                         ids.into_iter().collect()
+                     },
+                     Err(e) => {
+                         let _ = tx.send(ReembedResult::Progress(format!("Scan error: {}", e))).await;
+                         std::collections::HashSet::new()
+                     }
+                };
+                
+                // 2. Perform Re-embedding
+                let _ = tx.send(ReembedResult::Progress("Starting re-embedding...".to_string())).await;
+                
+                let result = rag.reembed_all(&skip_ids, |current, total, id, metadata| {
                     let display_name = if let Some(filename) = metadata.get("filename") {
                         filename.clone()
                     } else if let Some(name) = metadata.get("name") {
@@ -1442,7 +1542,7 @@ async fn run_sync_with_logging(
         let _ = tx.send(SyncResult::Log(format!("[{}/{}] Queued: {}", i + 1, total, name))).await;
     }
     
-    let _ = tx.send(SyncResult::Log("⏳ Scraping content (this may take a while)...".to_string())).await;
+    let _ = tx.send(SyncResult::Log(format!("⏳ Scraping content for {} subjects (this may take 2-3 mins)...", total))).await;
     let detailed_subjects = poliformat.scrape_subject_content(subjects).await?;
     let _ = tx.send(SyncResult::Log("✅ Downloads complete!".to_string())).await;
     
