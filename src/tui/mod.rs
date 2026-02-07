@@ -1065,13 +1065,19 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                         // Check for direct match or stem match
                         for filename in &all_filenames {
                             let filename_lower = filename.to_lowercase();
-                            let stem = if let Some(pos) = filename_lower.find(".pdf") {
-                                &filename_lower[..pos]
+                            
+                            // Extract just the basename (last component of path)
+                            let basename = filename_lower.rsplit('/').next().unwrap_or(&filename_lower);
+                            
+                            // Get stem without .pdf extension
+                            let stem = if let Some(pos) = basename.find(".pdf") {
+                                &basename[..pos]
                             } else {
-                                &filename_lower
+                                basename
                             };
 
-                            if word_lower == filename_lower || word_lower == stem {
+                            // Match against basename, stem, or if query contains stem
+                            if word_lower == basename || word_lower == stem || stem.contains(&word_lower) || word_lower.contains(stem) {
                                 mentioned_targets.push(filename.clone());
                             }
                         }
@@ -1099,23 +1105,81 @@ async fn handle_chat_input(app: &mut TuiApp, key: event::KeyEvent, state: &Arc<A
                         }
                     }
 
-                    // 2. Regular RAG search
+                    // 2. Regular RAG search - find relevant documents
                     let snippets = rag.search_snippets(&user_input, "user", 20).await.unwrap_or_default();
                     
                     tracing::info!("RAG search returned {} snippets for query: '{}'", snippets.len(), &user_input);
-                    for (i, (source, snippet, score)) in snippets.iter().enumerate() {
-                        tracing::debug!("Snippet {}: source='{}', score={:.3}, len={}", i, source, score, snippet.len());
+                    for (i, (source, _snippet, score)) in snippets.iter().enumerate() {
+                        tracing::debug!("Snippet {}: source='{}', score={:.3}", i, source, score);
+                    }
+                    
+                    // Collect unique source files from search results (excluding already mentioned ones)
+                    let mut rag_source_files: Vec<String> = Vec::new();
+                    for (source, _snippet, _score) in &snippets {
+                        // Check if this looks like a filename (contains . or /)
+                        if (source.contains('.') || source.contains('/')) && !rag_source_files.contains(source) {
+                            rag_source_files.push(source.clone());
+                        }
+                    }
+                    rag_source_files.truncate(3); // Limit to top 3 most relevant files
+                    
+                    tracing::info!("Found {} unique source files from RAG search", rag_source_files.len());
+                    
+                    // Context size limit: ~200k chars ≈ 50k tokens to stay safely under most LLM limits
+                    const MAX_CONTEXT_CHARS: usize = 200_000;
+                    let mut current_context_size = extra_context.len();
+                    
+                    // Fetch complete content for each source file found via RAG (with size limit)
+                    let mut rag_full_context = String::new();
+                    let mut included_files: Vec<String> = Vec::new();
+                    
+                    for source_file in &rag_source_files {
+                        if current_context_size >= MAX_CONTEXT_CHARS {
+                            tracing::info!("Context limit reached ({} chars), stopping full file inclusion", current_context_size);
+                            break;
+                        }
+                        
+                        if let Ok(chunks) = rag.get_file_chunks(source_file) {
+                            if !chunks.is_empty() {
+                                // Calculate approximate size of this file
+                                let file_content_size: usize = chunks.iter().map(|(_, c)| c.len()).sum();
+                                
+                                // Check if adding this file would exceed the limit
+                                if current_context_size + file_content_size > MAX_CONTEXT_CHARS && !rag_full_context.is_empty() {
+                                    tracing::info!("Skipping '{}' ({} chars) - would exceed context limit", source_file, file_content_size);
+                                    continue;
+                                }
+                                
+                                tracing::info!("Including FULL content of '{}' ({} chunks, ~{} chars) from RAG search", source_file, chunks.len(), file_content_size);
+                                rag_full_context.push_str(&format!("\n--- START OF FILE: {} ---\n", source_file));
+                                for (_id, content) in chunks {
+                                    // Extract content after the header (double newline)
+                                    if let Some(pos) = content.find("\n\n") {
+                                        rag_full_context.push_str(&content[pos + 2..]);
+                                    } else {
+                                        rag_full_context.push_str(&content);
+                                    }
+                                }
+                                rag_full_context.push_str(&format!("\n--- END OF FILE: {} ---\n", source_file));
+                                current_context_size += file_content_size;
+                                included_files.push(source_file.clone());
+                            }
+                        }
                     }
                     
                     let mut context_str = String::new();
                     if !extra_context.is_empty() {
                         context_str.push_str("You have been provided with the COMPLETE content of the requested document(s) below. Use this information as your primary source.\n");
                         context_str.push_str(&extra_context);
-                        context_str.push_str("\nAdditional relevant snippets from other documents:\n");
-                        for (source, snippet, _score) in snippets {
-                            context_str.push_str(&format!("\n[{}]:\n{}\n", source, snippet));
+                        if !rag_full_context.is_empty() {
+                            context_str.push_str("\nAdditional relevant documents:\n");
+                            context_str.push_str(&rag_full_context);
                         }
+                    } else if !rag_full_context.is_empty() {
+                        context_str.push_str("Relevant documents from your files (COMPLETE content):\n");
+                        context_str.push_str(&rag_full_context);
                     } else if !snippets.is_empty() {
+                        // Fallback: if no file chunks available, use snippets
                         context_str.push_str("Relevant context from your documents:\n");
                         for (source, snippet, _score) in snippets {
                             context_str.push_str(&format!("\n[{}]:\n{}\n", source, snippet));
